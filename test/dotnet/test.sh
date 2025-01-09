@@ -2,20 +2,28 @@
 
 set -e
 
-# Optional: Import test library
+# Optional: Import test library bundled with the devcontainer CLI
+# See https://github.com/devcontainers/cli/blob/HEAD/docs/features/test.md#dev-container-features-test-lib
+# Provides the 'check' and 'reportResults' commands.
 source dev-container-features-test-lib
 
-# Definition specific tests
-check "dotnet" dotnet --info
-check "sdks" dotnet --list-sdks
-check "version" dotnet --version
+# Feature-specific tests
+# The 'check' command comes from the dev-container-features-test-lib. Syntax is...
+# check <LABEL> <cmd> [args...]
+source dotnet_env.sh
+source dotnet_helpers.sh
 
-echo "Validating expected version present..."
-check "some major version of dotnet 7 is installed" bash -c "dotnet --version |  grep '7\.[0-9]*\.[0-9]*'"
+check "dotnet is installed in DOTNET_ROOT and execute permission is granted" \
+test -x "$DOTNET_ROOT/dotnet" 
 
-# Verify current symlink exists and works
-check "current link dotnet" /usr/local/dotnet/current/dotnet --info
-check "current link sdk" ls -l /usr/local/dotnet/current/sdk
+check "dotnet is symlinked correctly in /usr/bin" \
+test -L /usr/bin/dotnet -a "$(readlink -f /usr/bin/dotnet)" = "$DOTNET_ROOT/dotnet"
 
-# Report result
+expected=$(fetch_latest_version)
+
+check "Latest .NET SDK version installed" \
+is_dotnet_sdk_version_installed "$expected"
+
+# Report results
+# If any of the checks above exited with a non-zero exit code, the test will fail.
 reportResults

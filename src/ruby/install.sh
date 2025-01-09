@@ -23,9 +23,6 @@ ADDITIONAL_VERSIONS="${ADDITIONALVERSIONS:-""}"
 DEFAULT_GEMS="rake"
 
 RVM_GPG_KEYS="409B6B1796C275462A1703113804BB82D39DC0E3 7D2BAF1CF37B13E2069D6956105BD0E739499BDB"
-GPG_KEY_SERVERS="keyserver hkp://keyserver.ubuntu.com
-keyserver hkps://keys.openpgp.org
-keyserver hkp://keyserver.pgp.com"
 
 set -e
 
@@ -71,6 +68,38 @@ updaterc() {
     fi
 }
 
+# Get the list of GPG key servers that are reachable
+get_gpg_key_servers() {
+    declare -A keyservers_curl_map=(
+        ["hkp://keyserver.ubuntu.com"]="http://keyserver.ubuntu.com:11371"
+        ["hkp://keyserver.ubuntu.com:80"]="http://keyserver.ubuntu.com"
+        ["hkps://keys.openpgp.org"]="https://keys.openpgp.org"
+        ["hkp://keyserver.pgp.com"]="http://keyserver.pgp.com:11371"
+    )
+
+    local curl_args=""
+    local keyserver_reachable=false  # Flag to indicate if any keyserver is reachable
+
+    if [ ! -z "${KEYSERVER_PROXY}" ]; then
+        curl_args="--proxy ${KEYSERVER_PROXY}"
+    fi
+
+    for keyserver in "${!keyservers_curl_map[@]}"; do
+        local keyserver_curl_url="${keyservers_curl_map[${keyserver}]}"
+        if curl -s ${curl_args} --max-time 5 ${keyserver_curl_url} > /dev/null; then
+            echo "keyserver ${keyserver}"
+            keyserver_reachable=true
+        else
+            echo "(*) Keyserver ${keyserver} is not reachable." >&2
+        fi
+    done
+
+    if ! $keyserver_reachable; then
+        echo "(!) No keyserver is reachable." >&2
+        exit 1
+    fi
+}
+
 # Import the specified key in a variable name passed in as 
 receive_gpg_keys() {
     local keys=${!1}
@@ -79,11 +108,16 @@ receive_gpg_keys() {
         keyring_args="--no-default-keyring --keyring \"$2\""
     fi
 
+    # Install curl
+    if ! type curl > /dev/null 2>&1; then
+        check_packages curl
+    fi
+
     # Use a temporary location for gpg keys to avoid polluting image
     export GNUPGHOME="/tmp/tmp-gnupg"
     mkdir -p ${GNUPGHOME}
     chmod 700 ${GNUPGHOME}
-    echo -e "disable-ipv6\n${GPG_KEY_SERVERS}" > ${GNUPGHOME}/dirmngr.conf
+    echo -e "disable-ipv6\n$(get_gpg_key_servers)" > ${GNUPGHOME}/dirmngr.conf
     # GPG key download sometimes fails for some reason and retrying fixes it.
     local retry_count=0
     local gpg_ok="false"
@@ -93,7 +127,7 @@ receive_gpg_keys() {
         echo "(*) Downloading GPG key..."
         ( echo "${keys}" | xargs -n 1 gpg -q ${keyring_args} --recv-keys) 2>&1 && gpg_ok="true"
         if [ "${gpg_ok}" != "true" ]; then
-            echo "(*) Failed getting key, retring in 10s..."
+            echo "(*) Failed getting key, retrying in 10s..."
             (( retry_count++ ))
             sleep 10s
         fi
@@ -139,6 +173,47 @@ find_version_from_git_tags() {
     echo "${variable_name}=${!variable_name}"
 }
 
+# Use semver logic to decrement a version number then look for the closest match
+find_prev_version_from_git_tags() {
+    local variable_name=$1
+    local current_version=${!variable_name}
+    local repository=$2
+    # Normally a "v" is used before the version number, but support alternate cases
+    local prefix=${3:-"tags/v"}
+    # Some repositories use "_" instead of "." for version number part separation, support that
+    local separator=${4:-"."}
+    # Some tools release versions that omit the last digit (e.g. go)
+    local last_part_optional=${5:-"false"}
+    # Some repositories may have tags that include a suffix (e.g. actions/node-versions)
+    local version_suffix_regex=$6
+    # Try one break fix version number less if we get a failure. Use "set +e" since "set -e" can cause failures in valid scenarios.
+    set +e
+        major="$(echo "${current_version}" | grep -oE '^[0-9]+' || echo '')"
+        minor="$(echo "${current_version}" | grep -oP '^[0-9]+\.\K[0-9]+' || echo '')"
+        breakfix="$(echo "${current_version}" | grep -oP '^[0-9]+\.[0-9]+\.\K[0-9]+' 2>/dev/null || echo '')"
+
+        if [ "${minor}" = "0" ] && [ "${breakfix}" = "0" ]; then
+            ((major=major-1))
+            declare -g ${variable_name}="${major}"
+            # Look for latest version from previous major release
+            find_version_from_git_tags "${variable_name}" "${repository}" "${prefix}" "${separator}" "${last_part_optional}"
+        # Handle situations like Go's odd version pattern where "0" releases omit the last part
+        elif [ "${breakfix}" = "" ] || [ "${breakfix}" = "0" ]; then
+            ((minor=minor-1))
+            declare -g ${variable_name}="${major}.${minor}"
+            # Look for latest version from previous minor release
+            find_version_from_git_tags "${variable_name}" "${repository}" "${prefix}" "${separator}" "${last_part_optional}"
+        else
+            ((breakfix=breakfix-1))
+            if [ "${breakfix}" = "0" ] && [ "${last_part_optional}" = "true" ]; then
+                declare -g ${variable_name}="${major}.${minor}"
+            else 
+                declare -g ${variable_name}="${major}.${minor}.${breakfix}"
+            fi
+        fi
+    set -e
+}
+
 apt_get_update()
 {
     if [ "$(find /var/lib/apt/lists/* | wc -l)" = "0" ]; then
@@ -172,24 +247,50 @@ if ! type git > /dev/null 2>&1; then
     check_packages git
 fi
 
+# Function to fetch the version released prior to the latest version
+get_previous_version() {
+    local url=$1
+    local repo_url=$2
+    variable_name=$3
+    prev_version=${!variable_name}
+    
+    output=$(curl -s "$repo_url");
+
+    #install jq
+    check_packages jq
+
+    message=$(echo "$output" | jq -r '.message')
+
+    if [[ $message == "API rate limit exceeded"* ]]; then
+        echo -e "\nAn attempt to find latest version using GitHub Api Failed... \nReason: ${message}"
+        echo -e "\nAttempting to find latest version using GitHub tags."
+        find_prev_version_from_git_tags prev_version "$url" "tags/v" "_"
+        declare -g ${variable_name}="${prev_version}"
+    else 
+        echo -e "\nAttempting to find latest version using GitHub Api."
+        version=$(echo "$output" | jq -r '.tag_name' | tr '_' '.')
+        declare -g ${variable_name}="${version#v}"
+    fi  
+    echo "${variable_name}=${!variable_name}"
+}
+
+get_github_api_repo_url() {
+    local url=$1
+    echo "${url/https:\/\/github.com/https:\/\/api.github.com\/repos}/releases/latest"
+}
+
 
 # Figure out correct version of a three part version number is not passed
-find_version_from_git_tags RUBY_VERSION "https://github.com/ruby/ruby" "tags/v" "_"
+RUBY_URL="https://github.com/ruby/ruby"
+ORIGINAL_RUBY_VERSION=$RUBY_VERSION
+find_version_from_git_tags RUBY_VERSION $RUBY_URL "tags/v" "_"
 
-# Just install Ruby if RVM already installed
-if [ $(rvm --version) != "" ]; then
-    echo "Ruby Version Manager already exists."
-    if [ "${RUBY_VERSION}" != "none" ]; then
-        echo "Installing specified Ruby version."
-        su ${USERNAME} -c "rvm install ruby ${RUBY_VERSION}"
-    fi
-    SKIP_GEM_INSTALL="false"
-    SKIP_RBENV_RBUILD="true"
-else
-    # Install RVM
-    receive_gpg_keys RVM_GPG_KEYS
-    # Determine appropriate settings for rvm installer
+set_rvm_install_args() {
+    RUBY_VERSION=$1
     if [ "${RUBY_VERSION}" = "none" ]; then
+        RVM_INSTALL_ARGS=""
+    elif [[ "$(ruby -v)" = *"${RUBY_VERSION}"* ]]; then
+        echo "(!) Ruby is already installed with version ${RUBY_VERSION}. Skipping..."
         RVM_INSTALL_ARGS=""
     else
         if [ "${RUBY_VERSION}" = "latest" ] || [ "${RUBY_VERSION}" = "current" ] || [ "${RUBY_VERSION}" = "lts" ]; then
@@ -204,19 +305,48 @@ else
             DEFAULT_GEMS=""
         fi
     fi
+}
+
+install_previous_version() {
+    if [[ $ORIGINAL_RUBY_VERSION == "latest" ]]; then
+        repo_url=$(get_github_api_repo_url "$RUBY_URL")
+        get_previous_version "${RUBY_URL}" "${repo_url}" RUBY_VERSION
+        set_rvm_install_args $RUBY_VERSION
+        curl -sSL https://get.rvm.io | bash -s stable --ignore-dotfiles ${RVM_INSTALL_ARGS} --with-default-gems="${DEFAULT_GEMS}" 2>&1
+    else 
+        echo "Failed to install Ruby version $ORIGINAL_RUBY_VERSION. Exiting..."
+    fi
+}
+
+# Just install Ruby if RVM already installed
+if rvm --version > /dev/null; then
+    echo "Ruby Version Manager already exists."
+    if [[ "$(ruby -v)" = *"${RUBY_VERSION}"* ]]; then
+        echo "(!) Ruby is already installed with version ${RUBY_VERSION}. Skipping..."
+    elif [ "${RUBY_VERSION}" != "none" ]; then
+        echo "Installing specified Ruby version."
+        su ${USERNAME} -c "rvm install ruby ${RUBY_VERSION}"
+    fi
+    SKIP_GEM_INSTALL="false"
+    SKIP_RBENV_RBUILD="true"
+else
+    # Install RVM
+    receive_gpg_keys RVM_GPG_KEYS
+    # Determine appropriate settings for rvm installer
+    set_rvm_install_args $RUBY_VERSION
     # Create rvm group as a system group to reduce the odds of conflict with local user UIDs
     if ! cat /etc/group | grep -e "^rvm:" > /dev/null 2>&1; then
         groupadd -r rvm
     fi
     # Install rvm
-    curl -sSL https://get.rvm.io | bash -s stable --ignore-dotfiles ${RVM_INSTALL_ARGS} --with-default-gems="${DEFAULT_GEMS}" 2>&1
+    curl -sSL https://get.rvm.io | bash -s stable --ignore-dotfiles ${RVM_INSTALL_ARGS} --with-default-gems="${DEFAULT_GEMS}" 2>&1 || install_previous_version
     usermod -aG rvm ${USERNAME}
     source /usr/local/rvm/scripts/rvm
     rvm fix-permissions system
     rm -rf ${GNUPGHOME}
 fi
 
-if [ "${INSTALL_RUBY_TOOLS}" = "true" ]; then
+if [ "${INSTALL_RUBY_TOOLS}" = "true" ]; then   
     # Non-root user may not have "gem" in path when script is run and no ruby version
     # is installed by rvm, so handle this by using root's default gem in this case
     ROOT_GEM="$(which gem || echo "")"
@@ -233,7 +363,7 @@ if [ ! -z "${ADDITIONAL_VERSIONS}" ]; then
         read -a additional_versions <<< "$ADDITIONAL_VERSIONS"
         for version in "${additional_versions[@]}"; do
             # Figure out correct version of a three part version number is not passed
-            find_version_from_git_tags version "https://github.com/ruby/ruby" "tags/v" "_"
+            find_version_from_git_tags version $RUBY_URL "tags/v" "_"
             source /usr/local/rvm/scripts/rvm
             rvm install ruby ${version}
         done
@@ -273,8 +403,11 @@ if [ "${SKIP_RBENV_RBUILD}" != "true" ]; then
             ln -s /usr/local/share/ruby-build /home/${USERNAME}/.rbenv/plugins/ruby-build
         fi
 
-        ln -s /usr/local/rvm/rubies/default/bin/ruby /usr/local/rvm/gems/default/bin 
-        
+        # Oryx expects ruby to be installed in this specific path, else it breaks the oryx magic for ruby projects.
+        if [ ! -f /usr/local/rvm/gems/default/bin/ruby ]; then
+            ln -s /usr/local/rvm/rubies/default/bin/ruby /usr/local/rvm/gems/default/bin
+        fi
+
         chown -R "${USERNAME}:rvm" "/home/${USERNAME}/.rbenv/"
         chmod -R g+r+w "/home/${USERNAME}/.rbenv"
         find "/home/${USERNAME}/.rbenv" -type d | xargs -n 1 chmod g+s

@@ -9,6 +9,9 @@
 
 NOVNC_VERSION="${NOVNCVERSION:-"1.2.0"}" # TODO: Add in a 'latest' auto-detect and swap name to 'version'
 VNC_PASSWORD=${PASSWORD:-"vscode"}
+if [ "$VNC_PASSWORD" = "noPassword" ]; then
+    unset VNC_PASSWORD
+fi
 NOVNC_PORT="${WEBPORT:-6080}"
 VNC_PORT="${VNCPORT:-5901}"
 
@@ -41,7 +44,6 @@ package_list="
     libnotify4 \
     libnss3 \
     libxss1 \
-    libasound2 \
     xfonts-base \
     xfonts-terminus \
     fonts-noto \
@@ -198,6 +200,16 @@ fi
 # Install X11, fluxbox and VS Code dependencies
 check_packages ${package_list}
 
+# if Ubuntu-24.04, noble(numbat) found, then will install libasound2-dev instead of libasound2.
+# this change is temporary, https://packages.ubuntu.com/noble/libasound2 will switch to libasound2 once it is available for Ubuntu-24.04, noble(numbat)
+. /etc/os-release
+if [ "${ID}" = "ubuntu" ] && [ "${VERSION_CODENAME}" = "noble" ]; then
+    echo "Ubuntu 24.04, Noble(Numbat) detected. Installing libasound2-dev package..."
+    check_packages "libasound2-dev"
+else 
+    check_packages "libasound2"
+fi
+
 # On newer versions of Ubuntu (22.04), 
 # we need an additional package that isn't provided in earlier versions
 if ! type vncpasswd > /dev/null 2>&1; then
@@ -288,11 +300,11 @@ user_name="${USERNAME}"
 group_name="$(id -gn ${USERNAME})"
 LOG=/tmp/container-init.log
 
-export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-"autolaunch:"}"
-export DISPLAY="${DISPLAY:-:1}"
-export VNC_RESOLUTION="${VNC_RESOLUTION:-1440x768x16}" 
-export LANG="${LANG:-"en_US.UTF-8"}"
-export LANGUAGE="${LANGUAGE:-"en_US.UTF-8"}"
+export DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS:-"autolaunch:"}"
+export DISPLAY="\${DISPLAY:-:1}"
+export VNC_RESOLUTION="\${VNC_RESOLUTION:-1440x768x16}" 
+export LANG="\${LANG:-"en_US.UTF-8"}"
+export LANGUAGE="\${LANGUAGE:-"en_US.UTF-8"}"
 
 # Execute the command it not already running
 startInBackgroundIfNotRunning()
@@ -363,7 +375,15 @@ sudoIf chown root:\${group_name} /tmp/.X11-unix
 if [ "\$(echo "\${VNC_RESOLUTION}" | tr -cd 'x' | wc -c)" = "1" ]; then VNC_RESOLUTION=\${VNC_RESOLUTION}x16; fi
 screen_geometry="\${VNC_RESOLUTION%*x*}"
 screen_depth="\${VNC_RESOLUTION##*x}"
-startInBackgroundIfNotRunning "Xtigervnc" sudoUserIf "tigervncserver \${DISPLAY} -geometry \${screen_geometry} -depth \${screen_depth} -rfbport ${VNC_PORT} -dpi \${VNC_DPI:-96} -localhost -desktop fluxbox -fg -passwd /usr/local/etc/vscode-dev-containers/vnc-passwd"
+
+# Check if VNC_PASSWORD is set and use the appropriate command
+common_options="tigervncserver \${DISPLAY} -geometry \${screen_geometry} -depth \${screen_depth} -rfbport ${VNC_PORT} -dpi \${VNC_DPI:-96} -localhost -desktop fluxbox -fg"
+
+if [ -n "\${VNC_PASSWORD+x}" ]; then
+    startInBackgroundIfNotRunning "Xtigervnc" sudoUserIf "\${common_options} -passwd /usr/local/etc/vscode-dev-containers/vnc-passwd"
+else
+    startInBackgroundIfNotRunning "Xtigervnc" sudoUserIf "\${common_options} -SecurityTypes None"
+fi
 
 # Spin up noVNC if installed and not running.
 if [ -d "/usr/local/novnc" ] && [ "\$(ps -ef | grep /usr/local/novnc/noVNC*/utils/launch.sh | grep -v grep)" = "" ]; then
@@ -374,12 +394,18 @@ else
 fi
 
 # Run whatever was passed in
-log "Executing \"\$@\"."
-exec "\$@"
+if [ -n "$1" ]; then
+    log "Executing \"\$@\"."
+    exec "$@"
+else
+    log "No command provided to execute."
+fi
 log "** SCRIPT EXIT **"
 EOF
 
-echo "${VNC_PASSWORD}" | vncpasswd -f > /usr/local/etc/vscode-dev-containers/vnc-passwd
+if [ -n "${VNC_PASSWORD+x}" ]; then
+    echo "${VNC_PASSWORD}" | vncpasswd -f > /usr/local/etc/vscode-dev-containers/vnc-passwd
+fi
 chmod +x /usr/local/share/desktop-init.sh /usr/local/bin/set-resolution
 
 # Set up fluxbox config
@@ -392,15 +418,23 @@ fi
 # Clean up
 rm -rf /var/lib/apt/lists/*
 
+# Determine the message based on whether VNC_PASSWORD is set
+if [ -n "${VNC_PASSWORD+x}" ]; then
+    PASSWORD_MESSAGE="In both cases, use the password \"${VNC_PASSWORD}\" when connecting"
+else
+    PASSWORD_MESSAGE="In both cases, no password is required."
+fi
+
+# Display the message
 cat << EOF
 
 
 You now have a working desktop! Connect to in one of the following ways:
 
-- Forward port ${NOVNC_PORT} and use a web browser start the noVNC client (recommended)
+- Forward port ${NOVNC_PORT} and use a web browser to start the noVNC client (recommended)
 - Forward port ${VNC_PORT} using VS Code client and connect using a VNC Viewer
 
-In both cases, use the password "${VNC_PASSWORD}" when connecting
+${PASSWORD_MESSAGE}
 
 (*) Done!
 

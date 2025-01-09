@@ -18,7 +18,9 @@ Installs Node.js, nvm, yarn, pnpm, and needed dependencies.
 | version | Select or enter a Node.js version to install | string | lts |
 | nodeGypDependencies | Install dependencies to compile native node modules (node-gyp)? | boolean | true |
 | nvmInstallPath | The path where NVM will be installed. | string | /usr/local/share/nvm |
-| nvmVersion | Version of NVM to install. | string | 0.39.2 |
+| pnpmVersion | Select or enter the PNPM version to install | string | latest |
+| nvmVersion | Version of NVM to install. | string | latest |
+| installYarnUsingApt | On Debian and Ubuntu systems, you have the option to install Yarn globally via APT. If you choose not to use this option, Yarn will be set up using Corepack instead. This choice is specific to Debian and Ubuntu; for other Linux distributions, Yarn is always installed using Corepack, with a fallback to installation via NPM if an error occurs. | boolean | true |
 
 ## Customizations
 
@@ -48,7 +50,9 @@ Alternatively, you can start up an interactive shell which will in turn source `
 
 ## OS Support
 
-This Feature should work on recent versions of Debian/Ubuntu-based distributions with the `apt` package manager installed.
+Debian/Ubuntu, RedHat Enterprise Linux, Fedora, Alma, and Rocky Linux distributions with the `apt`, `yum`, `dnf`, or `microdnf` package manager installed.
+
+**Note**:  RedHat 7 Family (RedHat, CentOS, etc.) must use Node versions less than 18 due to its system libraries and long-term support (LTS) policies.
 
 `bash` is required to execute the `install.sh` script.
 
