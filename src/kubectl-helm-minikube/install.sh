@@ -22,9 +22,6 @@ MINIKUBE_SHA256="${MINIKUBE_SHA256:-"automatic"}"
 USERNAME="${USERNAME:-"${_REMOTE_USER:-"automatic"}"}"
 
 HELM_GPG_KEYS_URI="https://raw.githubusercontent.com/helm/helm/main/KEYS"
-GPG_KEY_SERVERS="keyserver hkp://keyserver.ubuntu.com
-keyserver hkps://keys.openpgp.org
-keyserver hkp://keyserver.pgp.com"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo -e 'Script must be run as root. Use sudo, su, or add "USER root" to your Dockerfile before running this script.'
@@ -87,6 +84,47 @@ find_version_from_git_tags() {
     echo "${variable_name}=${!variable_name}"
 }
 
+# Use semver logic to decrement a version number then look for the closest match
+find_prev_version_from_git_tags() {
+    local variable_name=$1
+    local current_version=${!variable_name}
+    local repository=$2
+    # Normally a "v" is used before the version number, but support alternate cases
+    local prefix=${3:-"tags/v"}
+    # Some repositories use "_" instead of "." for version number part separation, support that
+    local separator=${4:-"."}
+    # Some tools release versions that omit the last digit (e.g. go)
+    local last_part_optional=${5:-"false"}
+    # Some repositories may have tags that include a suffix (e.g. actions/node-versions)
+    local version_suffix_regex=$6
+    # Try one break fix version number less if we get a failure. Use "set +e" since "set -e" can cause failures in valid scenarios.
+    set +e
+        major="$(echo "${current_version}" | grep -oE '^[0-9]+' || echo '')"
+        minor="$(echo "${current_version}" | grep -oP '^[0-9]+\.\K[0-9]+' || echo '')"
+        breakfix="$(echo "${current_version}" | grep -oP '^[0-9]+\.[0-9]+\.\K[0-9]+' 2>/dev/null || echo '')"
+
+        if [ "${minor}" = "0" ] && [ "${breakfix}" = "0" ]; then
+            ((major=major-1))
+            declare -g ${variable_name}="${major}"
+            # Look for latest version from previous major release
+            find_version_from_git_tags "${variable_name}" "${repository}" "${prefix}" "${separator}" "${last_part_optional}"
+        # Handle situations like Go's odd version pattern where "0" releases omit the last part
+        elif [ "${breakfix}" = "" ] || [ "${breakfix}" = "0" ]; then
+            ((minor=minor-1))
+            declare -g ${variable_name}="${major}.${minor}"
+            # Look for latest version from previous minor release
+            find_version_from_git_tags "${variable_name}" "${repository}" "${prefix}" "${separator}" "${last_part_optional}"
+        else
+            ((breakfix=breakfix-1))
+            if [ "${breakfix}" = "0" ] && [ "${last_part_optional}" = "true" ]; then
+                declare -g ${variable_name}="${major}.${minor}"
+            else 
+                declare -g ${variable_name}="${major}.${minor}.${breakfix}"
+            fi
+        fi
+    set -e
+}
+
 apt_get_update()
 {
     if [ "$(find /var/lib/apt/lists/* | wc -l)" = "0" ]; then
@@ -147,30 +185,105 @@ if [ ${KUBECTL_VERSION} != "none" ]; then
     kubectl completion bash > /etc/bash_completion.d/kubectl
 
     # kubectl zsh completion
-    if [ -e "${USERHOME}}/.oh-my-zsh" ]; then
+    if [ -e "${USERHOME}/.oh-my-zsh" ]; then
         mkdir -p "${USERHOME}/.oh-my-zsh/completions"
         kubectl completion zsh > "${USERHOME}/.oh-my-zsh/completions/_kubectl"
         chown -R "${USERNAME}" "${USERHOME}/.oh-my-zsh"
     fi
 fi
 
-if [ ${HELM_VERSION} != "none" ]; then
-    # Install Helm, verify signature and checksum
-    echo "Downloading Helm..."
-    find_version_from_git_tags HELM_VERSION "https://github.com/helm/helm"
-    if [ "${HELM_VERSION::1}" != 'v' ]; then
-        HELM_VERSION="v${HELM_VERSION}"
-    fi
-    mkdir -p /tmp/helm
+# Function to fetch the version released prior to the latest version
+get_previous_version() {
+    local url=$1
+    local repo_url=$2
+    local variable_name=$3
+    prev_version=${!variable_name#v}
+    
+    output=$(curl -s "$repo_url");
+
+    check_packages jq
+
+    message=$(echo "$output" | jq -r '.message')
+    if [[ $message == "API rate limit exceeded"* ]]; then
+        echo -e "\nAn attempt to find latest version using GitHub Api Failed... \nReason: ${message}"
+        echo -e "\nAttempting to find latest version using GitHub tags."
+        find_prev_version_from_git_tags prev_version "$url" "tags/v"
+        declare -g ${variable_name}="v${prev_version}"
+    else 
+        echo -e "\nAttempting to find latest version using GitHub Api."
+        version=$(echo "$output" | jq -r '.tag_name')
+        declare -g ${variable_name}="${version}"
+    fi  
+    echo "${variable_name}=${!variable_name}"
+}
+
+get_github_api_repo_url() {
+    local url=$1
+    echo "${url/https:\/\/github.com/https:\/\/api.github.com\/repos}/releases/latest"
+}
+
+get_helm() {
+    HELM_VERSION=$1
     helm_filename="helm-${HELM_VERSION}-linux-${architecture}.tar.gz"
     tmp_helm_filename="/tmp/helm/${helm_filename}"
     curl -sSL "https://get.helm.sh/${helm_filename}" -o "${tmp_helm_filename}"
     curl -sSL "https://github.com/helm/helm/releases/download/${HELM_VERSION}/${helm_filename}.asc" -o "${tmp_helm_filename}.asc"
+}
+
+# Get the list of GPG key servers that are reachable
+get_gpg_key_servers() {
+    declare -A keyservers_curl_map=(
+        ["hkp://keyserver.ubuntu.com"]="http://keyserver.ubuntu.com:11371"
+        ["hkp://keyserver.ubuntu.com:80"]="http://keyserver.ubuntu.com"
+        ["hkps://keys.openpgp.org"]="https://keys.openpgp.org"
+        ["hkp://keyserver.pgp.com"]="http://keyserver.pgp.com:11371"
+    )
+
+    local curl_args=""
+    local keyserver_reachable=false  # Flag to indicate if any keyserver is reachable
+
+    if [ ! -z "${KEYSERVER_PROXY}" ]; then
+        curl_args="--proxy ${KEYSERVER_PROXY}"
+    fi
+
+    for keyserver in "${!keyservers_curl_map[@]}"; do
+        local keyserver_curl_url="${keyservers_curl_map[${keyserver}]}"
+        if curl -s ${curl_args} --max-time 5 ${keyserver_curl_url} > /dev/null; then
+            echo "keyserver ${keyserver}"
+            keyserver_reachable=true
+        else
+            echo "(*) Keyserver ${keyserver} is not reachable." >&2
+        fi
+    done
+
+    if ! $keyserver_reachable; then
+        echo "(!) No keyserver is reachable." >&2
+        exit 1
+    fi
+}
+
+if [ ${HELM_VERSION} != "none" ]; then
+    # Install Helm, verify signature and checksum
+    echo "Downloading Helm..."
+    helm_url="https://github.com/helm/helm"
+    find_version_from_git_tags HELM_VERSION "${helm_url}"
+    if [ "${HELM_VERSION::1}" != 'v' ]; then
+        HELM_VERSION="v${HELM_VERSION}"
+    fi
+    mkdir -p /tmp/helm
+    get_helm "${HELM_VERSION}"
+    if grep -q "BlobNotFound" "${tmp_helm_filename}"; then
+        echo -e "\n(!) Failed to fetch the latest artifacts for helm ${HELM_VERSION}..."
+        repo_url=$(get_github_api_repo_url "${helm_url}")
+        get_previous_version "${helm_url}" "${repo_url}" HELM_VERSION
+        echo -e "\nAttempting to install ${HELM_VERSION}"
+        get_helm "${HELM_VERSION}"
+    fi
     export GNUPGHOME="/tmp/helm/gnupg"
     mkdir -p "${GNUPGHOME}"
     chmod 700 ${GNUPGHOME}
     curl -sSL "${HELM_GPG_KEYS_URI}" -o /tmp/helm/KEYS
-    echo -e "disable-ipv6\n${GPG_KEY_SERVERS}" > ${GNUPGHOME}/dirmngr.conf
+    echo -e "disable-ipv6\n$(get_gpg_key_servers)" > ${GNUPGHOME}/dirmngr.conf
     gpg -q --import "/tmp/helm/KEYS"
     if ! gpg --verify "${tmp_helm_filename}.asc" > ${GNUPGHOME}/verify.log 2>&1; then
         echo "Verification failed!"
@@ -197,6 +310,16 @@ if [ ${HELM_VERSION} != "none" ]; then
     if ! type helm > /dev/null 2>&1; then
         echo '(!) Helm installation failed!'
         exit 1
+    fi
+
+    # helm bash completion
+    helm completion bash > /etc/bash_completion.d/helm
+
+    # helm zsh completion
+    if [ -e "${USERHOME}/.oh-my-zsh" ]; then
+        mkdir -p "${USERHOME}/.oh-my-zsh/completions"
+        helm completion zsh > "${USERHOME}/.oh-my-zsh/completions/_helm"
+        chown -R "${USERNAME}" "${USERHOME}/.oh-my-zsh"
     fi
 fi
 

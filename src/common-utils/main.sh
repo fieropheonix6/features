@@ -12,6 +12,7 @@ set -e
 INSTALL_ZSH="${INSTALLZSH:-"true"}"
 CONFIGURE_ZSH_AS_DEFAULT_SHELL="${CONFIGUREZSHASDEFAULTSHELL:-"false"}"
 INSTALL_OH_MY_ZSH="${INSTALLOHMYZSH:-"true"}"
+INSTALL_OH_MY_ZSH_CONFIG="${INSTALLOHMYZSHCONFIG:-"true"}"
 UPGRADE_PACKAGES="${UPGRADEPACKAGES:-"true"}"
 USERNAME="${USERNAME:-"automatic"}"
 USER_UID="${USERUID:-"automatic"}"
@@ -27,7 +28,11 @@ install_debian_packages() {
     # Ensure apt is in non-interactive to avoid prompts
     export DEBIAN_FRONTEND=noninteractive
 
-    local package_list="apt-utils \
+    local package_list=""
+    if [ "${PACKAGES_ALREADY_INSTALLED}" != "true" ]; then
+        package_list="${package_list} \
+        apt-utils \
+        bash-completion \
         openssh-client \
         gnupg2 \
         dirmngr \
@@ -44,6 +49,7 @@ install_debian_packages() {
         ca-certificates \
         unzip \
         bzip2 \
+        xz-utils \
         zip \
         nano \
         vim-tiny \
@@ -69,49 +75,54 @@ install_debian_packages() {
         manpages-dev \
         init-system-helpers"
 
-    # Needed for adding manpages-posix and manpages-posix-dev which are non-free packages in Debian
-    if [ "${ADD_NON_FREE_PACKAGES}" = "true" ]; then
-        # Bring in variables from /etc/os-release like VERSION_CODENAME
-        sed -i -E "s/deb http:\/\/(deb|httpredir)\.debian\.org\/debian ${VERSION_CODENAME} main/deb http:\/\/\1\.debian\.org\/debian ${VERSION_CODENAME} main contrib non-free/" /etc/apt/sources.list
-        sed -i -E "s/deb-src http:\/\/(deb|httredir)\.debian\.org\/debian ${VERSION_CODENAME} main/deb http:\/\/\1\.debian\.org\/debian ${VERSION_CODENAME} main contrib non-free/" /etc/apt/sources.list
-        sed -i -E "s/deb http:\/\/(deb|httpredir)\.debian\.org\/debian ${VERSION_CODENAME}-updates main/deb http:\/\/\1\.debian\.org\/debian ${VERSION_CODENAME}-updates main contrib non-free/" /etc/apt/sources.list
-        sed -i -E "s/deb-src http:\/\/(deb|httpredir)\.debian\.org\/debian ${VERSION_CODENAME}-updates main/deb http:\/\/\1\.debian\.org\/debian ${VERSION_CODENAME}-updates main contrib non-free/" /etc/apt/sources.list
-        sed -i "s/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}\/updates main/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}\/updates main contrib non-free/" /etc/apt/sources.list
-        sed -i "s/deb-src http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}\/updates main/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}\/updates main contrib non-free/" /etc/apt/sources.list
-        sed -i "s/deb http:\/\/deb\.debian\.org\/debian ${VERSION_CODENAME}-backports main/deb http:\/\/deb\.debian\.org\/debian ${VERSION_CODENAME}-backports main contrib non-free/" /etc/apt/sources.list
-        sed -i "s/deb-src http:\/\/deb\.debian\.org\/debian ${VERSION_CODENAME}-backports main/deb http:\/\/deb\.debian\.org\/debian ${VERSION_CODENAME}-backports main contrib non-free/" /etc/apt/sources.list
-        # Handle bullseye location for security https://www.debian.org/releases/bullseye/amd64/release-notes/ch-information.en.html
-        sed -i "s/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}-security main/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}-security main contrib non-free/" /etc/apt/sources.list
-        sed -i "s/deb-src http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}-security main/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}-security main contrib non-free/" /etc/apt/sources.list
-        echo "Running apt-get update..."
-        package_list="${package_list} manpages-posix manpages-posix-dev"
-    fi
+        # Include libssl1.1 if available
+        if [[ ! -z $(apt-cache --names-only search ^libssl1.1$) ]]; then
+            package_list="${package_list} libssl1.1"
+        fi
 
-    # Include libssl1.1 if available
-    if [[ ! -z $(apt-cache --names-only search ^libssl1.1$) ]]; then
-        package_list="${package_list} libssl1.1"
-    fi
+        # Include libssl3 if available
+        if [[ ! -z $(apt-cache --names-only search ^libssl3$) ]]; then
+            package_list="${package_list} libssl3"
+        fi
 
-    # Include libssl3 if available
-    if [[ ! -z $(apt-cache --names-only search ^libssl3$) ]]; then
-        package_list="${package_list} libssl3"
-    fi
+        # Include appropriate version of libssl1.0.x if available
+        local libssl_package=$(dpkg-query -f '${db:Status-Abbrev}\t${binary:Package}\n' -W 'libssl1\.0\.?' 2>&1 || echo '')
+        if [ "$(echo "$libssl_package" | grep -o 'libssl1\.0\.[0-9]:' | uniq | sort | wc -l)" -eq 0 ]; then
+            if [[ ! -z $(apt-cache --names-only search ^libssl1.0.2$) ]]; then
+                # Debian 9
+                package_list="${package_list} libssl1.0.2"
+            elif [[ ! -z $(apt-cache --names-only search ^libssl1.0.0$) ]]; then
+                # Ubuntu 18.04
+                package_list="${package_list} libssl1.0.0"
+            fi
+        fi
 
-    # Include appropriate version of libssl1.0.x if available
-    local libssl_package=$(dpkg-query -f '${db:Status-Abbrev}\t${binary:Package}\n' -W 'libssl1\.0\.?' 2>&1 || echo '')
-    if [ "$(echo "$libssl_package" | grep -o 'libssl1\.0\.[0-9]:' | uniq | sort | wc -l)" -eq 0 ]; then
-        if [[ ! -z $(apt-cache --names-only search ^libssl1.0.2$) ]]; then
-            # Debian 9
-            package_list="${package_list} libssl1.0.2"
-        elif [[ ! -z $(apt-cache --names-only search ^libssl1.0.0$) ]]; then
-            # Ubuntu 18.04
-            package_list="${package_list} libssl1.0.0"
+        # Include git if not already installed (may be more recent than distro version)
+        if ! type git > /dev/null 2>&1; then
+            package_list="${package_list} git"
         fi
     fi
 
-    # Include git if not already installed (may be more recent than distro version)
-    if ! type git > /dev/null 2>&1; then
-        package_list="${package_list} git"
+    # Needed for adding manpages-posix and manpages-posix-dev which are non-free packages in Debian
+    if [ "${ADD_NON_FREE_PACKAGES}" = "true" ]; then
+        if [[ ! -e "/etc/apt/sources.list" ]] && [[ -e "/etc/apt/sources.list.d/debian.sources" ]]; then 
+            sed -i '/^URIs: http:\/\/deb.debian.org\/debian$/ { N; N; s/Components: main/Components: main non-free non-free-firmware/ }' /etc/apt/sources.list.d/debian.sources
+        else
+            # Bring in variables from /etc/os-release like VERSION_CODENAME
+            sed -i -E "s/deb http:\/\/(deb|httpredir)\.debian\.org\/debian ${VERSION_CODENAME} main/deb http:\/\/\1\.debian\.org\/debian ${VERSION_CODENAME} main contrib non-free/" /etc/apt/sources.list
+            sed -i -E "s/deb-src http:\/\/(deb|httredir)\.debian\.org\/debian ${VERSION_CODENAME} main/deb http:\/\/\1\.debian\.org\/debian ${VERSION_CODENAME} main contrib non-free/" /etc/apt/sources.list
+            sed -i -E "s/deb http:\/\/(deb|httpredir)\.debian\.org\/debian ${VERSION_CODENAME}-updates main/deb http:\/\/\1\.debian\.org\/debian ${VERSION_CODENAME}-updates main contrib non-free/" /etc/apt/sources.list
+            sed -i -E "s/deb-src http:\/\/(deb|httpredir)\.debian\.org\/debian ${VERSION_CODENAME}-updates main/deb http:\/\/\1\.debian\.org\/debian ${VERSION_CODENAME}-updates main contrib non-free/" /etc/apt/sources.list
+            sed -i "s/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}\/updates main/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}\/updates main contrib non-free/" /etc/apt/sources.list
+            sed -i "s/deb-src http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}\/updates main/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}\/updates main contrib non-free/" /etc/apt/sources.list
+            sed -i "s/deb http:\/\/deb\.debian\.org\/debian ${VERSION_CODENAME}-backports main/deb http:\/\/deb\.debian\.org\/debian ${VERSION_CODENAME}-backports main contrib non-free/" /etc/apt/sources.list
+            sed -i "s/deb-src http:\/\/deb\.debian\.org\/debian ${VERSION_CODENAME}-backports main/deb http:\/\/deb\.debian\.org\/debian ${VERSION_CODENAME}-backports main contrib non-free/" /etc/apt/sources.list
+            # Handle bullseye location for security https://www.debian.org/releases/bullseye/amd64/release-notes/ch-information.en.html
+            sed -i "s/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}-security main/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}-security main contrib non-free/" /etc/apt/sources.list
+            sed -i "s/deb-src http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}-security main/deb http:\/\/security\.debian\.org\/debian-security ${VERSION_CODENAME}-security main contrib non-free/" /etc/apt/sources.list
+        fi;
+        echo "Running apt-get update..."
+        package_list="${package_list} manpages-posix manpages-posix-dev"
     fi
 
     # Install the list of packages
@@ -138,6 +149,8 @@ install_debian_packages() {
         LOCALE_ALREADY_SET="true"
     fi
 
+    PACKAGES_ALREADY_INSTALLED="true"
+
     # Clean up
     apt-get -y clean
     rm -rf /var/lib/apt/lists/*
@@ -145,54 +158,74 @@ install_debian_packages() {
 
 # RedHat / RockyLinux / CentOS / Fedora packages
 install_redhat_packages() {
-    local package_list="\
-        gawk \
-        openssh-clients \
-        gnupg2 \
-        iproute \
-        procps \
-        lsof \
-        net-tools \
-        psmisc \
-        wget \
-        ca-certificates \
-        rsync \
-        unzip \
-        zip \
-        nano \
-        vim-minimal \
-        less \
-        jq \
-        openssl-libs \
-        krb5-libs \
-        libicu \
-        zlib \
-        sudo \
-        sed \
-        grep \
-        which \
-        man-db \
-        strace"
-
-    # rockylinux:9 installs 'curl-minimal' which clashes with 'curl'
-    # Install 'curl' for every OS except this rockylinux:9
-    if [[ "${ID}" = "rocky" ]] && [[ "${VERSION}" != *"9."* ]]; then
-        package_list="${package_list} curl"
+    local package_list=""
+    local remove_epel="false"
+    local install_cmd=microdnf
+    if ! type microdnf > /dev/null 2>&1; then
+        install_cmd=dnf
+        if ! type dnf > /dev/null 2>&1; then
+            install_cmd=yum
+        fi
     fi
 
-    # Install OpenSSL 1.0 compat if needed
-    if ${install_cmd} -q list compat-openssl10 >/dev/null 2>&1; then
-        package_list="${package_list} compat-openssl10"
-    fi
+    if [ "${PACKAGES_ALREADY_INSTALLED}" != "true" ]; then
+        package_list="${package_list} \
+            gawk \
+            bash-completion \
+            openssh-clients \
+            gnupg2 \
+            iproute \
+            procps \
+            lsof \
+            net-tools \
+            psmisc \
+            wget \
+            ca-certificates \
+            rsync \
+            unzip \
+            xz \
+            zip \
+            nano \
+            vim-minimal \
+            less \
+            jq \
+            openssl-libs \
+            krb5-libs \
+            libicu \
+            zlib \
+            sudo \
+            sed \
+            grep \
+            which \
+            man-db \
+            strace"
 
-    # Install lsb_release if available
-    if ${install_cmd} -q list redhat-lsb-core >/dev/null 2>&1; then
-        package_list="${package_list} redhat-lsb-core"
-    fi
+        # rockylinux:9 installs 'curl-minimal' which clashes with 'curl'
+        # Install 'curl' for every OS except this rockylinux:9
+        if [[ "${ID}" = "rocky" ]] && [[ "${VERSION}" != *"9."* ]]; then
+            package_list="${package_list} curl"
+        fi
 
-    # Install git if not already installed (may be more recent than distro version)
-    if ! type git > /dev/null 2>&1; then
-        package_list="${package_list} git"
+        # Install OpenSSL 1.0 compat if needed
+        if ${install_cmd} -q list compat-openssl10 >/dev/null 2>&1; then
+            package_list="${package_list} compat-openssl10"
+        fi
+
+        # Install lsb_release if available
+        if ${install_cmd} -q list redhat-lsb-core >/dev/null 2>&1; then
+            package_list="${package_list} redhat-lsb-core"
+        fi
+
+        # Install git if not already installed (may be more recent than distro version)
+        if ! type git > /dev/null 2>&1; then
+            package_list="${package_list} git"
+        fi
+
+        # Install EPEL repository if needed (required to install 'jq' for CentOS)
+        if ! ${install_cmd} -q list jq >/dev/null 2>&1; then
+            ${install_cmd} -y install epel-release
+            remove_epel="true"
+        fi
     fi
 
     # Install zsh if needed
@@ -200,73 +233,89 @@ install_redhat_packages() {
         package_list="${package_list} zsh"
     fi
 
-    local install_cmd=dnf
-    if ! type dnf > /dev/null 2>&1; then
-        install_cmd=yum
+    if [ -n "${package_list}" ]; then
+        ${install_cmd} -y install ${package_list}
     fi
-    ${install_cmd} -y install ${package_list}
 
     # Get to latest versions of all packages
     if [ "${UPGRADE_PACKAGES}" = "true" ]; then
         ${install_cmd} upgrade -y
     fi
+
+    if [[ "${remove_epel}" = "true" ]]; then
+        ${install_cmd} -y remove epel-release
+    fi
+
+    PACKAGES_ALREADY_INSTALLED="true"
 }
 
 # Alpine Linux packages
 install_alpine_packages() {
     apk update
-    apk add --no-cache \
-        openssh-client \
-        gnupg \
-        procps \
-        lsof \
-        htop \
-        net-tools \
-        psmisc \
-        curl \
-        wget \
-        rsync \
-        ca-certificates \
-        unzip \
-        zip \
-        nano \
-        vim \
-        less \
-        jq \
-        libgcc \
-        libstdc++ \
-        krb5-libs \
-        libintl \
-        libssl1.1 \
-        lttng-ust \
-        tzdata \
-        userspace-rcu \
-        zlib \
-        sudo \
-        coreutils \
-        sed \
-        grep \
-        which \
-        ncdu \
-        shadow \
-        strace
 
-    # Install man pages - package name varies between 3.12 and earlier versions
-    if apk info man > /dev/null 2>&1; then
-        apk add --no-cache man man-pages
-    else
-        apk add --no-cache mandoc man-pages
-    fi
+    if [ "${PACKAGES_ALREADY_INSTALLED}" != "true" ]; then
+        apk add --no-cache \
+            openssh-client \
+            bash-completion \
+            gnupg \
+            procps \
+            lsof \
+            htop \
+            net-tools \
+            psmisc \
+            curl \
+            wget \
+            rsync \
+            ca-certificates \
+            unzip \
+            xz \
+            zip \
+            nano \
+            vim \
+            less \
+            jq \
+            libgcc \
+            libstdc++ \
+            krb5-libs \
+            libintl \
+            lttng-ust \
+            tzdata \
+            userspace-rcu \
+            zlib \
+            sudo \
+            coreutils \
+            sed \
+            grep \
+            which \
+            ncdu \
+            shadow \
+            strace
 
-    # Install git if not already installed (may be more recent than distro version)
-    if ! type git > /dev/null 2>&1; then
-        apk add --no-cache git
+        # # Include libssl1.1 if available (not available for 3.19 and newer)
+        LIBSSL1_PKG=libssl1.1
+        if [[ $(apk search --no-cache -a $LIBSSL1_PKG | grep $LIBSSL1_PKG) ]]; then
+            apk add --no-cache $LIBSSL1_PKG
+        fi
+
+        # Install man pages - package name varies between 3.12 and earlier versions
+        if apk info man > /dev/null 2>&1; then
+            apk add --no-cache man man-pages
+        else
+            apk add --no-cache mandoc man-pages
+        fi
+
+        # Install git if not already installed (may be more recent than distro version)
+        if ! type git > /dev/null 2>&1; then
+            apk add --no-cache git
+        fi
     fi
 
     # Install zsh if needed
     if [ "${INSTALL_ZSH}" = "true" ] && ! type zsh > /dev/null 2>&1; then
         apk add --no-cache zsh
     fi
+
+    PACKAGES_ALREADY_INSTALLED="true"
 }
 
 # ******************
@@ -297,6 +346,7 @@ if [ "${ID}" = "debian" ] || [ "${ID_LIKE}" = "debian" ]; then
     ADJUSTED_ID="debian"
 elif [[ "${ID}" = "rhel" || "${ID}" = "fedora" || "${ID}" = "mariner" || "${ID_LIKE}" = *"rhel"* || "${ID_LIKE}" = *"fedora"* || "${ID_LIKE}" = *"mariner"* ]]; then
     ADJUSTED_ID="rhel"
+    VERSION_CODENAME="${ID}${VERSION_ID}"
 elif [ "${ID}" = "alpine" ]; then
     ADJUSTED_ID="alpine"
 else
@@ -304,21 +354,34 @@ else
     exit 1
 fi
 
-# Install packages for appropriate OS
-if [ "${PACKAGES_ALREADY_INSTALLED}" != "true" ]; then
-    case "${ADJUSTED_ID}" in
-        "debian")
-            install_debian_packages
-            ;;
-        "rhel")
-            install_redhat_packages
-            ;;
-        "alpine")
-            install_alpine_packages
-            ;;
-    esac
-    PACKAGES_ALREADY_INSTALLED="true"
+if [ "${ADJUSTED_ID}" = "rhel" ] && [ "${VERSION_CODENAME-}" = "centos7" ]; then
+    # As of 1 July 2024, mirrorlist.centos.org no longer exists.
+    # Update the repo files to reference vault.centos.org.
+    sed -i s/mirror.centos.org/vault.centos.org/g /etc/yum.repos.d/*.repo
+    sed -i s/^#.*baseurl=http/baseurl=http/g /etc/yum.repos.d/*.repo
+    sed -i s/^mirrorlist=http/#mirrorlist=http/g /etc/yum.repos.d/*.repo
 fi
+
+if [ "${ADJUSTED_ID}" = "rhel" ] && [ "${VERSION_CODENAME-}" = "centos7" ]; then
+    # As of 1 July 2024, mirrorlist.centos.org no longer exists.
+    # Update the repo files to reference vault.centos.org.
+    sed -i s/mirror.centos.org/vault.centos.org/g /etc/yum.repos.d/*.repo
+    sed -i s/^#.*baseurl=http/baseurl=http/g /etc/yum.repos.d/*.repo
+    sed -i s/^mirrorlist=http/#mirrorlist=http/g /etc/yum.repos.d/*.repo
+fi
+
+# Install packages for appropriate OS
+case "${ADJUSTED_ID}" in
+    "debian")
+        install_debian_packages
+        ;;
+    "rhel")
+        install_redhat_packages
+        ;;
+    "alpine")
+        install_alpine_packages
+        ;;
+esac
 
 # If in automatic mode, determine if a user already exists, if not use vscode
 if [ "${USERNAME}" = "auto" ] || [ "${USERNAME}" = "automatic" ]; then
@@ -381,6 +444,9 @@ fi
 
 if [ "${USERNAME}" = "root" ]; then
     user_home="/root"
+# Check if user already has a home directory other than /home/${USERNAME}
+elif [ "/home/${USERNAME}" != $( getent passwd $USERNAME | cut -d: -f6 ) ]; then
+    user_home=$( getent passwd $USERNAME | cut -d: -f6 )
 else
     user_home="/home/${USERNAME}"
     if [ ! -d "${user_home}" ]; then
@@ -390,7 +456,9 @@ else
 fi
 
 # Restore user .bashrc / .profile / .zshrc defaults from skeleton file if it doesn't exist or is empty
-possible_rc_files=( ".bashrc" ".profile" ".zshrc" )
+possible_rc_files=( ".bashrc" ".profile" )
+[ "$INSTALL_OH_MY_ZSH_CONFIG" == "true" ] && possible_rc_files+=('.zshrc')
+[ "$INSTALL_ZSH" == "true" ] && possible_rc_files+=('.zprofile')
 for rc_file in "${possible_rc_files[@]}"; do
     if [ -f "/etc/skel/${rc_file}" ]; then
         if [ ! -e "${user_home}/${rc_file}" ] || [ ! -s "${user_home}/${rc_file}" ]; then
@@ -426,50 +494,75 @@ fi
 
 # Optionally configure zsh and Oh My Zsh!
 if [ "${INSTALL_ZSH}" = "true" ]; then
+   if [ ! -f "${user_home}/.zprofile" ]; then
+        touch "${user_home}/.zprofile"
+        echo 'source $HOME/.profile' >> "${user_home}/.zprofile" # TODO: Reconsider adding '.profile' to '.zprofile'
+        chown ${USERNAME}:${group_name} "${user_home}/.zprofile"
+    fi
+
     if [ "${ZSH_ALREADY_INSTALLED}" != "true" ]; then
         if [ "${ADJUSTED_ID}" = "rhel" ]; then
              global_rc_path="/etc/zshrc"
         else
             global_rc_path="/etc/zsh/zshrc"
         fi
-        cat "${FEATURE_DIR}/scripts/rc_snippet.sh" >> /etc/zshrc
+        cat "${FEATURE_DIR}/scripts/rc_snippet.sh" >> ${global_rc_path}
         ZSH_ALREADY_INSTALLED="true"
     fi
 
     if [ "${CONFIGURE_ZSH_AS_DEFAULT_SHELL}" == "true" ]; then
+        # Fixing chsh always asking for a password on alpine linux
+        # ref: https://askubuntu.com/questions/812420/chsh-always-asking-a-password-and-get-pam-authentication-failure.
+        if [ ! -f "/etc/pam.d/chsh" ] || ! grep -Eq '^auth(.*)pam_rootok\.so$' /etc/pam.d/chsh; then
+            echo "auth sufficient pam_rootok.so" >> /etc/pam.d/chsh
+        elif [[ -n "$(awk '/^auth(.*)pam_rootok\.so$/ && !/^auth[[:blank:]]+sufficient[[:blank:]]+pam_rootok\.so$/' /etc/pam.d/chsh)" ]]; then
+            awk '/^auth(.*)pam_rootok\.so$/ { $2 = "sufficient" } { print }' /etc/pam.d/chsh > /tmp/chsh.tmp && mv /tmp/chsh.tmp /etc/pam.d/chsh
+        fi
+
         chsh --shell /bin/zsh ${USERNAME}
     fi
 
     # Adapted, simplified inline Oh My Zsh! install steps that adds, defaults to a codespaces theme.
     # See https://github.com/ohmyzsh/ohmyzsh/blob/master/tools/install.sh for official script.
-    oh_my_install_dir="${user_home}/.oh-my-zsh"
-    if [ ! -d "${oh_my_install_dir}" ] && [ "${INSTALL_OH_MY_ZSH}" = "true" ]; then
-        template_path="${oh_my_install_dir}/templates/zshrc.zsh-template"
+    if [ "${INSTALL_OH_MY_ZSH}" = "true" ]; then
         user_rc_file="${user_home}/.zshrc"
-        umask g-w,o-w
-        mkdir -p ${oh_my_install_dir}
-        git clone --depth=1 \
-            -c core.eol=lf \
-            -c core.autocrlf=false \
-            -c fsck.zeroPaddedFilemode=ignore \
-            -c fetch.fsck.zeroPaddedFilemode=ignore \
-            -c receive.fsck.zeroPaddedFilemode=ignore \
-            "https://github.com/ohmyzsh/ohmyzsh" "${oh_my_install_dir}" 2>&1
-        echo -e "$(cat "${template_path}")\nDISABLE_AUTO_UPDATE=true\nDISABLE_UPDATE_PROMPT=true" > ${user_rc_file}
-        sed -i -e 's/ZSH_THEME=.*/ZSH_THEME="devcontainers"/g' ${user_rc_file}
+        oh_my_install_dir="${user_home}/.oh-my-zsh"
+        template_path="${oh_my_install_dir}/templates/zshrc.zsh-template"
+        if [ ! -d "${oh_my_install_dir}" ]; then
+            umask g-w,o-w
+            mkdir -p ${oh_my_install_dir}
+            git clone --depth=1 \
+                -c core.eol=lf \
+                -c core.autocrlf=false \
+                -c fsck.zeroPaddedFilemode=ignore \
+                -c fetch.fsck.zeroPaddedFilemode=ignore \
+                -c receive.fsck.zeroPaddedFilemode=ignore \
+                "https://github.com/ohmyzsh/ohmyzsh" "${oh_my_install_dir}" 2>&1
+
+            # Shrink git while still enabling updates
+            cd "${oh_my_install_dir}"
+            git repack -a -d -f --depth=1 --window=1
+        fi
 
         # Add Dev Containers theme
         mkdir -p ${oh_my_install_dir}/custom/themes
         cp -f "${FEATURE_DIR}/scripts/devcontainers.zsh-theme" "${oh_my_install_dir}/custom/themes/devcontainers.zsh-theme"
-        ln -s "${oh_my_install_dir}/custom/themes/devcontainers.zsh-theme" "${oh_my_install_dir}/custom/themes/codespaces.zsh-theme"
+        ln -sf "${oh_my_install_dir}/custom/themes/devcontainers.zsh-theme" "${oh_my_install_dir}/custom/themes/codespaces.zsh-theme"
 
-        # Shrink git while still enabling updates
-        cd "${oh_my_install_dir}"
-        git repack -a -d -f --depth=1 --window=1
+        # Add devcontainer .zshrc template
+        if [ "$INSTALL_OH_MY_ZSH_CONFIG" = "true" ]; then
+            if ! [ -f "${template_path}" ] || ! grep -qF "$(head -n 1 "${template_path}")" "${user_rc_file}"; then
+                echo -e "$(cat "${template_path}")\nDISABLE_AUTO_UPDATE=true\nDISABLE_UPDATE_PROMPT=true" > ${user_rc_file}
+            fi
+            sed -i -e 's/ZSH_THEME=.*/ZSH_THEME="devcontainers"/g' ${user_rc_file}
+        fi
+
         # Copy to non-root user if one is specified
         if [ "${USERNAME}" != "root" ]; then
-            cp -rf "${user_rc_file}" "${oh_my_install_dir}" /root
-            chown -R ${USERNAME}:${group_name} "${oh_my_install_dir}" "${user_rc_file}"
+            copy_to_user_files=("${oh_my_install_dir}")
+            [ -f "$user_rc_file" ] && copy_to_user_files+=("$user_rc_file")
+            cp -rf "${copy_to_user_files[@]}" /root
+            chown -R ${USERNAME}:${group_name} "${copy_to_user_files[@]}"
         fi
     fi
 fi
@@ -493,7 +586,7 @@ chmod +rx /usr/local/bin/code
 
 # systemctl shim for Debian/Ubuntu - tells people to use 'service' if systemd is not running
 if [ "${ADJUSTED_ID}" = "debian" ]; then
-    cp -f "${FEATURE_DIR}/bin/systemctl" /usr/local/bin/systemctl
+    cp -fL "${FEATURE_DIR}/bin/systemctl" /usr/local/bin/systemctl
     chmod +rx /usr/local/bin/systemctl
 fi
 

@@ -27,10 +27,7 @@ TFSEC_SHA256="${TFSEC_SHA256:-"automatic"}"
 TERRAFORM_DOCS_SHA256="${TERRAFORM_DOCS_SHA256:-"automatic"}"
 
 TERRAFORM_GPG_KEY="72D7468F"
-TFLINT_GPG_KEY_URI="https://raw.githubusercontent.com/terraform-linters/tflint/master/8CE69160EB3F2FE9.key"
-GPG_KEY_SERVERS="keyserver hkps://keyserver.ubuntu.com
-keyserver hkps://keys.openpgp.org
-keyserver hkps://keyserver.pgp.com"
+TFLINT_GPG_KEY_URI="https://raw.githubusercontent.com/terraform-linters/tflint/v0.46.1/8CE69160EB3F2FE9.key"
 KEYSERVER_PROXY="${HTTPPROXY:-"${HTTP_PROXY:-""}"}"
 
 architecture="$(uname -m)"
@@ -47,6 +44,37 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# Get the list of GPG key servers that are reachable
+get_gpg_key_servers() {
+    declare -A keyservers_curl_map=(
+        ["hkps://keyserver.ubuntu.com"]="https://keyserver.ubuntu.com"
+        ["hkps://keys.openpgp.org"]="https://keys.openpgp.org"
+        ["hkps://keyserver.pgp.com"]="https://keyserver.pgp.com"
+    )
+
+    local curl_args=""
+    local keyserver_reachable=false  # Flag to indicate if any keyserver is reachable
+
+    if [ ! -z "${KEYSERVER_PROXY}" ]; then
+        curl_args="--proxy ${KEYSERVER_PROXY}"
+    fi
+
+    for keyserver in "${!keyservers_curl_map[@]}"; do
+        local keyserver_curl_url="${keyservers_curl_map[${keyserver}]}"
+        if curl -s ${curl_args} --max-time 5 ${keyserver_curl_url} > /dev/null; then
+            echo "keyserver ${keyserver}"
+            keyserver_reachable=true
+        else
+            echo "(*) Keyserver ${keyserver} is not reachable." >&2
+        fi
+    done
+
+    if ! $keyserver_reachable; then
+        echo "(!) No keyserver is reachable." >&2
+        exit 1
+    fi
+}
+
 # Import the specified key in a variable name passed in as 
 receive_gpg_keys() {
     local keys=${!1}
@@ -58,11 +86,16 @@ receive_gpg_keys() {
 	keyring_args="${keyring_args} --keyserver-options http-proxy=${KEYSERVER_PROXY}"
     fi
 
+    # Install curl
+    if ! type curl > /dev/null 2>&1; then
+        check_packages curl
+    fi
+
     # Use a temporary location for gpg keys to avoid polluting image
     export GNUPGHOME="/tmp/tmp-gnupg"
     mkdir -p ${GNUPGHOME}
     chmod 700 ${GNUPGHOME}
-    echo -e "disable-ipv6\n${GPG_KEY_SERVERS}" > ${GNUPGHOME}/dirmngr.conf
+    echo -e "disable-ipv6\n$(get_gpg_key_servers)" > ${GNUPGHOME}/dirmngr.conf
     # GPG key download sometimes fails for some reason and retrying fixes it.
     local retry_count=0
     local gpg_ok="false"
@@ -72,11 +105,30 @@ receive_gpg_keys() {
         echo "(*) Downloading GPG key..."
         ( echo "${keys}" | xargs -n 1 gpg -q ${keyring_args} --recv-keys) 2>&1 && gpg_ok="true"
         if [ "${gpg_ok}" != "true" ]; then
-            echo "(*) Failed getting key, retring in 10s..."
+            echo "(*) Failed getting key, retrying in 10s..."
             (( retry_count++ ))
             sleep 10s
         fi
     done
+
+    # If all attempts fail, try getting the keyserver IP address and explicitly passing it to gpg
+    if [ "${gpg_ok}" = "false" ]; then
+        retry_count=0;
+        echo "(*) Resolving GPG keyserver IP address..."
+        local keyserver_ip_address=$( dig +short keyserver.ubuntu.com | head -n1 )
+        echo "(*) GPG keyserver IP address $keyserver_ip_address"
+        
+        until [ "${gpg_ok}" = "true" ] || [ "${retry_count}" -eq "3" ]; 
+        do
+            echo "(*) Downloading GPG key..."
+            ( echo "${keys}" | xargs -n 1 gpg -q ${keyring_args} --recv-keys --keyserver ${keyserver_ip_address}) 2>&1 && gpg_ok="true"
+            if [ "${gpg_ok}" != "true" ]; then
+                echo "(*) Failed getting key, retrying in 10s..."
+                (( retry_count++ ))
+                sleep 10s
+            fi
+        done
+    fi
     set -e
     if [ "${gpg_ok}" = "false" ]; then
         echo "(!) Failed to get gpg key."
@@ -116,6 +168,47 @@ find_version_from_git_tags() {
         exit 1
     fi
     echo "${variable_name}=${!variable_name}"
+}
+
+# Use semver logic to decrement a version number then look for the closest match
+find_prev_version_from_git_tags() {
+    local variable_name=$1
+    local current_version=${!variable_name}
+    local repository=$2
+    # Normally a "v" is used before the version number, but support alternate cases
+    local prefix=${3:-"tags/v"}
+    # Some repositories use "_" instead of "." for version number part separation, support that
+    local separator=${4:-"."}
+    # Some tools release versions that omit the last digit (e.g. go)
+    local last_part_optional=${5:-"false"}
+    # Some repositories may have tags that include a suffix (e.g. actions/node-versions)
+    local version_suffix_regex=$6
+    # Try one break fix version number less if we get a failure. Use "set +e" since "set -e" can cause failures in valid scenarios.
+    set +e
+        major="$(echo "${current_version}" | grep -oE '^[0-9]+' || echo '')"
+        minor="$(echo "${current_version}" | grep -oP '^[0-9]+\.\K[0-9]+' || echo '')"
+        breakfix="$(echo "${current_version}" | grep -oP '^[0-9]+\.[0-9]+\.\K[0-9]+' 2>/dev/null || echo '')"
+
+        if [ "${minor}" = "0" ] && [ "${breakfix}" = "0" ]; then
+            ((major=major-1))
+            declare -g ${variable_name}="${major}"
+            # Look for latest version from previous major release
+            find_version_from_git_tags "${variable_name}" "${repository}" "${prefix}" "${separator}" "${last_part_optional}"
+        # Handle situations like Go's odd version pattern where "0" releases omit the last part
+        elif [ "${breakfix}" = "" ] || [ "${breakfix}" = "0" ]; then
+            ((minor=minor-1))
+            declare -g ${variable_name}="${major}.${minor}"
+            # Look for latest version from previous minor release
+            find_version_from_git_tags "${variable_name}" "${repository}" "${prefix}" "${separator}" "${last_part_optional}"
+        else
+            ((breakfix=breakfix-1))
+            if [ "${breakfix}" = "0" ] && [ "${last_part_optional}" = "true" ]; then
+                declare -g ${variable_name}="${major}.${minor}"
+            else 
+                declare -g ${variable_name}="${major}.${minor}.${breakfix}"
+            fi
+        fi
+    set -e
 }
 
 find_sentinel_version_from_url() {
@@ -158,27 +251,125 @@ check_packages() {
     fi
 }
 
+# Function to fetch the version released prior to the latest version
+get_previous_version() {
+    local url=$1
+    local repo_url=$2
+    local variable_name=$3
+    prev_version=${!variable_name}
+    
+    output=$(curl -s "$repo_url");
+
+    # install jq
+    check_packages jq
+    
+    message=$(echo "$output" | jq -r '.message')
+    
+    if [[ $message == "API rate limit exceeded"* ]]; then
+        echo -e "\nAn attempt to find latest version using GitHub Api Failed... \nReason: ${message}"
+        echo -e "\nAttempting to find latest version using GitHub tags."
+        find_prev_version_from_git_tags prev_version "$url" "tags/v"
+        declare -g ${variable_name}="${prev_version}"
+    else
+        echo -e "\nAttempting to find latest version using GitHub Api."
+        version=$(echo "$output" | jq -r '.tag_name')
+        declare -g ${variable_name}="${version#v}"
+    fi  
+    echo "${variable_name}=${!variable_name}"
+}
+
+get_github_api_repo_url() {
+    local url=$1
+    echo "${url/https:\/\/github.com/https:\/\/api.github.com\/repos}/releases/latest"
+}
+
+install_previous_version() {
+    given_version=$1
+    requested_version=${!given_version}
+    local URL=$2
+    INSTALLER_FN=$3
+    local REPO_URL=$(get_github_api_repo_url "$URL")
+    local PKG_NAME=$(get_pkg_name "${given_version}")
+    echo -e "\n(!) Failed to fetch the latest artifacts for ${PKG_NAME} v${requested_version}..."
+    get_previous_version "$URL" "$REPO_URL" requested_version
+    echo -e "\nAttempting to install ${requested_version}"
+    declare -g ${given_version}="${requested_version#v}"
+    $INSTALLER_FN "${!given_version}"
+    echo "${given_version}=${!given_version}"
+}
+
+install_cosign() {
+    COSIGN_VERSION=$1
+    local URL=$2
+    cosign_filename="/tmp/cosign_${COSIGN_VERSION}_${architecture}.deb"
+    cosign_url="https://github.com/sigstore/cosign/releases/latest/download/cosign_${COSIGN_VERSION}_${architecture}.deb"
+    curl -L "${cosign_url}" -o $cosign_filename
+    if grep -q "Not Found" "$cosign_filename"; then
+        echo -e "\n(!) Failed to fetch the latest artifacts for cosign v${COSIGN_VERSION}..."
+        REPO_URL=$(get_github_api_repo_url "$URL")
+        get_previous_version "$URL" "$REPO_URL" COSIGN_VERSION
+        echo -e "\nAttempting to install ${COSIGN_VERSION}"
+        cosign_filename="/tmp/cosign_${COSIGN_VERSION}_${architecture}.deb"
+        cosign_url="https://github.com/sigstore/cosign/releases/latest/download/cosign_${COSIGN_VERSION}_${architecture}.deb"
+        curl -L "${cosign_url}" -o $cosign_filename
+    fi
+    dpkg -i $cosign_filename
+    rm $cosign_filename
+    echo "Installation of cosign succeeded with ${COSIGN_VERSION}."
+}
+
+# Install 'cosign' for validating signatures
+# https://docs.sigstore.dev/cosign/overview/
+ensure_cosign() {
+    check_packages curl ca-certificates gnupg2
+
+    if ! type cosign > /dev/null 2>&1; then
+        echo "Installing cosign..."
+        COSIGN_VERSION="latest"
+        cosign_url='https://github.com/sigstore/cosign'
+        find_version_from_git_tags COSIGN_VERSION "${cosign_url}"
+        install_cosign "${COSIGN_VERSION}" "${cosign_url}"
+    fi
+    if ! type cosign > /dev/null 2>&1; then
+        echo "(!) Failed to install cosign."
+        exit 1
+    fi
+    cosign version
+}
+
 # Ensure apt is in non-interactive to avoid prompts
 export DEBIAN_FRONTEND=noninteractive
 
 # Install dependencies if missing
-check_packages curl ca-certificates gnupg2 dirmngr coreutils unzip
+check_packages curl ca-certificates gnupg2 dirmngr coreutils unzip dnsutils
 if ! type git > /dev/null 2>&1; then
     check_packages git
 fi
 
+terraform_url='https://github.com/hashicorp/terraform'
+tflint_url='https://github.com/terraform-linters/tflint'
+terragrunt_url='https://github.com/gruntwork-io/terragrunt'
 # Verify requested version is available, convert latest
-find_version_from_git_tags TERRAFORM_VERSION 'https://github.com/hashicorp/terraform'
-find_version_from_git_tags TFLINT_VERSION 'https://github.com/terraform-linters/tflint'
-find_version_from_git_tags TERRAGRUNT_VERSION 'https://github.com/gruntwork-io/terragrunt'
+find_version_from_git_tags TERRAFORM_VERSION "$terraform_url"
+find_version_from_git_tags TFLINT_VERSION "$tflint_url"
+find_version_from_git_tags TERRAGRUNT_VERSION "$terragrunt_url"
+
+install_terraform() {
+    local TERRAFORM_VERSION=$1
+    terraform_filename="terraform_${TERRAFORM_VERSION}_linux_${architecture}.zip"
+    curl -sSL -o ${terraform_filename} "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/${terraform_filename}"
+}
 
 mkdir -p /tmp/tf-downloads
 cd /tmp/tf-downloads
-
 # Install Terraform, tflint, Terragrunt
 echo "Downloading terraform..."
 terraform_filename="terraform_${TERRAFORM_VERSION}_linux_${architecture}.zip"
-curl -sSL -o ${terraform_filename} "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/${terraform_filename}"
+install_terraform "$TERRAFORM_VERSION"
+if grep -q "The specified key does not exist." "${terraform_filename}"; then
+    install_previous_version TERRAFORM_VERSION $terraform_url "install_terraform"
+    terraform_filename="terraform_${TERRAFORM_VERSION}_linux_${architecture}.zip"
+fi
 if [ "${TERRAFORM_SHA256}" != "dev-mode" ]; then
     if [ "${TERRAFORM_SHA256}" = "automatic" ]; then
         receive_gpg_keys TERRAFORM_GPG_KEY
@@ -193,29 +384,72 @@ fi
 unzip ${terraform_filename}
 mv -f terraform /usr/local/bin/
 
+install_tflint() {
+    TFLINT_VERSION=$1
+    curl -sSL -o /tmp/tf-downloads/${TFLINT_FILENAME} https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/${TFLINT_FILENAME}
+}
+
 if [ "${TFLINT_VERSION}" != "none" ]; then
     echo "Downloading tflint..."
     TFLINT_FILENAME="tflint_linux_${architecture}.zip"
-    curl -sSL -o /tmp/tf-downloads/${TFLINT_FILENAME} https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/${TFLINT_FILENAME}
-    if [ "${TFLINT_SHA256}" != "dev-mode" ]; then
-        if [ "${TFLINT_SHA256}" = "automatic" ]; then
-            curl -sSL -o tflint_key "${TFLINT_GPG_KEY_URI}"
-            gpg -q --import tflint_key
-            curl -sSL -o tflint_checksums.txt https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt
-            curl -sSL -o tflint_checksums.txt.sig https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.sig
-            gpg --verify tflint_checksums.txt.sig tflint_checksums.txt
-        else
-            echo "${TFLINT_SHA256} *${TFLINT_FILENAME}" > tflint_checksums.txt
-        fi
-        sha256sum --ignore-missing -c tflint_checksums.txt
+    install_tflint "$TFLINT_VERSION"
+    if grep -q "Not Found" "/tmp/tf-downloads/${TFLINT_FILENAME}"; then 
+        install_previous_version TFLINT_VERSION "$tflint_url" "install_tflint"
     fi
+    if [ "${TFLINT_SHA256}" != "dev-mode" ]; then
+
+        if [ "${TFLINT_SHA256}" != "automatic" ]; then
+            echo "${TFLINT_SHA256} *${TFLINT_FILENAME}" > tflint_checksums.txt
+            sha256sum --ignore-missing -c tflint_checksums.txt
+        else
+            curl -sSL -o tflint_checksums.txt https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt
+
+            set +e
+            curl -sSL -o checksums.txt.keyless.sig https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.keyless.sig
+            set -e
+
+            # Check that checksums.txt.keyless.sig exists and is not empty
+            if [ -s checksums.txt.keyless.sig ]; then
+                # Validate checksums with cosign
+                curl -sSL -o checksums.txt.pem https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.pem
+                ensure_cosign
+                cosign verify-blob \
+                    --certificate=/tmp/tf-downloads/checksums.txt.pem \
+                    --signature=/tmp/tf-downloads/checksums.txt.keyless.sig \
+                    --certificate-identity-regexp="^https://github.com/terraform-linters/tflint"  \
+                    --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+                    /tmp/tf-downloads/tflint_checksums.txt
+                # Ensure that checksums.txt has $TFLINT_FILENAME
+                grep ${TFLINT_FILENAME} /tmp/tf-downloads/tflint_checksums.txt
+                # Validate downloaded file
+                sha256sum --ignore-missing -c tflint_checksums.txt
+            else
+                # Fallback to older, GPG-based verification (pre-0.47.0 of tflint)
+                curl -sSL -o tflint_checksums.txt.sig https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.sig
+                curl -sSL -o tflint_key "${TFLINT_GPG_KEY_URI}"
+                gpg -q --import tflint_key
+                gpg --verify tflint_checksums.txt.sig tflint_checksums.txt
+            fi
+        fi
+    fi
+
     unzip /tmp/tf-downloads/${TFLINT_FILENAME}
     mv -f tflint /usr/local/bin/
 fi
+
+install_terragrunt() {
+    TERRAGRUNT_VERSION=$1
+    curl -sSL -o /tmp/tf-downloads/${terragrunt_filename} https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/${terragrunt_filename}
+}
+
 if [ "${TERRAGRUNT_VERSION}" != "none" ]; then
     echo "Downloading Terragrunt..."
     terragrunt_filename="terragrunt_linux_${architecture}"
-    curl -sSL -o /tmp/tf-downloads/${terragrunt_filename} https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/${terragrunt_filename}
+    install_terragrunt "$TERRAGRUNT_VERSION"
+    output=$(cat "/tmp/tf-downloads/${terragrunt_filename}")
+    if [[ $output == "Not Found" ]]; then
+        install_previous_version TERRAGRUNT_VERSION $terragrunt_url "install_terragrunt"
+    fi
     if [ "${TERRAGRUNT_SHA256}" != "dev-mode" ]; then
         if [ "${TERRAGRUNT_SHA256}" = "automatic" ]; then
             curl -sSL -o terragrunt_SHA256SUMS https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/SHA256SUMS
@@ -253,12 +487,23 @@ if [ "${INSTALL_SENTINEL}" = "true" ]; then
     mv -f /tmp/tf-downloads/sentinel /usr/local/bin/sentinel
 fi
 
+install_tfsec() {
+    local TFSEC_VERSION=$1
+    tfsec_filename="tfsec_${TFSEC_VERSION}_linux_${architecture}.tar.gz"
+    curl -sSL -o /tmp/tf-downloads/${tfsec_filename} https://github.com/aquasecurity/tfsec/releases/download/v${TFSEC_VERSION}/${tfsec_filename}
+}
+
 if [ "${INSTALL_TFSEC}" = "true" ]; then
     TFSEC_VERSION="latest"
-    find_version_from_git_tags TFSEC_VERSION 'https://github.com/aquasecurity/tfsec'
+    tfsec_url='https://github.com/aquasecurity/tfsec'
+    find_version_from_git_tags TFSEC_VERSION $tfsec_url
     tfsec_filename="tfsec_${TFSEC_VERSION}_linux_${architecture}.tar.gz"
     echo "(*) Downloading TFSec... ${tfsec_filename}"
-    curl -sSL -o /tmp/tf-downloads/${tfsec_filename} https://github.com/aquasecurity/tfsec/releases/download/v${TFSEC_VERSION}/${tfsec_filename}
+    install_tfsec "$TFSEC_VERSION"
+    if grep -q "Not Found" "/tmp/tf-downloads/${tfsec_filename}"; then 
+        install_previous_version TFSEC_VERSION $tfsec_url "install_tfsec"
+        tfsec_filename="tfsec_${TFSEC_VERSION}_linux_${architecture}.tar.gz"
+    fi
     if [ "${TFSEC_SHA256}" != "dev-mode" ]; then
         if [ "${TFSEC_SHA256}" = "automatic" ]; then
             curl -sSL -o tfsec_SHA256SUMS https://github.com/aquasecurity/tfsec/releases/download/v${TFSEC_VERSION}/tfsec_${TFSEC_VERSION}_checksums.txt
@@ -273,12 +518,23 @@ if [ "${INSTALL_TFSEC}" = "true" ]; then
     mv -f /tmp/tf-downloads/tfsec/tfsec /usr/local/bin/tfsec
 fi
 
+install_terraform_docs() {
+    local TERRAFORM_DOCS_VERSION=$1
+    tfdocs_filename="terraform-docs-v${TERRAFORM_DOCS_VERSION}-linux-${architecture}.tar.gz"
+    curl -sSL -o /tmp/tf-downloads/${tfdocs_filename} https://github.com/terraform-docs/terraform-docs/releases/download/v${TERRAFORM_DOCS_VERSION}/${tfdocs_filename}
+}
+
 if [ "${INSTALL_TERRAFORM_DOCS}" = "true" ]; then
     TERRAFORM_DOCS_VERSION="latest"
-    find_version_from_git_tags TERRAFORM_DOCS_VERSION 'https://github.com/terraform-docs/terraform-docs'
+    terraform_docs_url='https://github.com/terraform-docs/terraform-docs'
+    find_version_from_git_tags TERRAFORM_DOCS_VERSION $terraform_docs_url
     tfdocs_filename="terraform-docs-v${TERRAFORM_DOCS_VERSION}-linux-${architecture}.tar.gz"
     echo "(*) Downloading Terraform docs... ${tfdocs_filename}"
-    curl -sSL -o /tmp/tf-downloads/${tfdocs_filename} https://github.com/terraform-docs/terraform-docs/releases/download/v${TERRAFORM_DOCS_VERSION}/${tfdocs_filename}
+    install_terraform_docs "$TERRAFORM_DOCS_VERSION"
+    if grep -q "Not Found" "/tmp/tf-downloads/${tfdocs_filename}"; then
+        install_previous_version TERRAFORM_DOCS_VERSION $terraform_docs_url "install_terraform_docs"
+        tfdocs_filename="terraform-docs-v${TERRAFORM_DOCS_VERSION}-linux-${architecture}.tar.gz"
+    fi
     if [ "${TERRAFORM_DOCS_SHA256}" != "dev-mode" ]; then
         if [ "${TERRAFORM_DOCS_SHA256}" = "automatic" ]; then
             curl -sSL -o tfdocs_SHA256SUMS https://github.com/terraform-docs/terraform-docs/releases/download/v${TERRAFORM_DOCS_VERSION}/terraform-docs-v${TERRAFORM_DOCS_VERSION}.sha256sum

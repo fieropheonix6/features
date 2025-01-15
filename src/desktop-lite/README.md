@@ -16,10 +16,10 @@ Adds a lightweight Fluxbox based desktop to the container that can be accessed u
 | Options Id | Description | Type | Default Value |
 |-----|-----|-----|-----|
 | version | Currently Unused! | string | latest |
-| noVncVersion | NoVnc Version | string | 1.2.0 |
-| password | Enter a password for desktop connections | string | vscode |
-| webPort | Enter a port for the VNC web client | string | 6080 |
-| vncPort | Enter a port for the desktop VNC server | string | 5901 |
+| noVncVersion | The noVNC version to use | string | 1.2.0 |
+| password | Enter a password for desktop connections. If "noPassword", connections from the local host can be established without entering a password | string | vscode |
+| webPort | Enter a port for the VNC web client (noVNC) | string | 6080 |
+| vncPort | Enter a port for the desktop VNC server (TigerVNC) | string | 5901 |
 
 ## Connecting to the desktop
 
@@ -29,16 +29,26 @@ This feature provides two ways of connecting to the desktop environment it adds.
 1. Open the ports view in your tool, select the noVNC port, and click the Globe icon.
 1. In the browser that appears, click the **Connect** button and enter the desktop password (`vscode` by default).
 
+To set up the `6080` port from your `devcontainer.json` file, include the following:
+```json
+  "forwardPorts": [6080],
+  "portsAttributes": {
+    "6080": {
+      "label": "desktop"
+    }
+  }
+```
+
 You can also connect to the desktop using a [VNC viewer](https://www.realvnc.com/en/connect/download/viewer/). To do so:
 
 1. Connect to the environment from a desktop tool that supports the dev container spec (e.g., VS Code client).
-1. Forward the VNC server port (`5901` by default) to your local machine using either the `forwardPorts` property in `devcontainer.json` or the user interface in your tool (e.g., you can press <kbd>F1</kbd> or <kbd>Ctrl/Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> and select **Ports: Focus on Ports View** in VS Code to bring it into focus).
+1. Forward the VNC server port (`5901` by default) to your local machine using either the `forwardPorts` property in `devcontainer.json` or the user interface in your tool (e.g., you can press <kbd>F1</kbd> or <kbd>Ctrl/Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> and select **Ports: Focus on Ports View** in VS Code to bring it into focus). If you are using the [Dev Container CLI](https://github.com/devcontainers/cli), you should instead use the `appPort` property in `devcontainer.json`.
 1. Start your VNC Viewer and connect to localhost:5901. Note that you may need to bump up the color depth to 24 bits to see full color.
 1. Enter the desktop password (`vscode` by default).
 
 ## Customizing Fluxbox
 
-The window manager is installed is [Fluxbox](http://fluxbox.org/). **Right-click** to see the application menu. In addition, any UI-based commands you execute inside the dev container will automatically appear on the desktop.
+The window manager installed is [Fluxbox](http://fluxbox.org/). **Right-click** to see the application menu. In addition, any UI-based commands you execute inside the dev container will automatically appear on the desktop.
 
 You can customize the desktop using Fluxbox configuration files. The configuration files are located in the `.fluxbox` folder of the home directory of the user you using to connect to the dev container (`$HOME/.fluxbox`).
 

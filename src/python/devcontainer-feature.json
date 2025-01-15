@@ -1,6 +1,6 @@
 {
   "id": "python",
-  "version": "1.1.0",
+  "version": "1.7.0",
   "name": "Python",
   "documentationURL": "https://github.com/devcontainers/features/tree/main/src/python",
   "description": "Installs the provided version of Python, as well as PIPX, and other common Python utilities.  JupyterLab is conditionally installed with the python feature. Note: May require source code compilation.",
@@ -11,6 +11,7 @@
         "latest",
         "os-provided",
         "none",
+        "3.12",
         "3.11",
         "3.10",
         "3.9",
@@ -24,12 +25,22 @@
     "installTools": {
       "type": "boolean",
       "default": true,
-      "description": "Install common Python tools like pylint"
+      "description": "Flag indicating whether or not to install the tools specified via the 'toolsToInstall' option. Default is 'true'."
+    },
+    "toolsToInstall": {
+      "type": "string",
+      "default": "flake8,autopep8,black,yapf,mypy,pydocstyle,pycodestyle,bandit,pipenv,virtualenv,pytest,pylint",
+      "description": "Comma-separated list of tools to install when 'installTools' is true. Defaults to a set of common Python tools like pylint."
     },
     "optimize": {
       "type": "boolean",
       "default": false,
       "description": "Optimize Python for performance when compiled (slow)"
+    },
+    "enableShared": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable building a shared Python library"
     },
     "installPath": {
       "type": "string",
@@ -56,29 +67,25 @@
     "PYTHON_PATH": "/usr/local/python/current",
     "PIPX_HOME": "/usr/local/py-utils",
     "PIPX_BIN_DIR": "/usr/local/py-utils/bin",
-    "PATH": "/usr/local/python/current/bin:/usr/local/py-utils/bin:${PATH}"
+    "PATH": "/usr/local/python/current/bin:/usr/local/py-utils/bin:/usr/local/jupyter:${PATH}"
   },
   "customizations": {
     "vscode": {
       "extensions": [
         "ms-python.python",
-        "ms-python.vscode-pylance"
+        "ms-python.vscode-pylance",
+        "ms-python.autopep8"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/usr/local/python/current/bin/python",
-        "python.formatting.autopep8Path": "/usr/local/py-utils/bin/autopep8",
-        "python.formatting.blackPath": "/usr/local/py-utils/bin/black",
-        "python.linting.flake8Path": "/usr/local/py-utils/bin/flake8",
-        "python.linting.flake8Enabled": false,
-        "python.linting.mypyPath": "/usr/local/py-utils/bin/mypy",
-        "python.linting.mypyEnabled": false,
-        "python.linting.pylintPath": "/usr/local/py-utils/bin/pylint",
-        "python.linting.pylintEnabled": false
+        "[python]": {
+          "editor.defaultFormatter": "ms-python.autopep8"
+        }
       }
     }
   },
   "installsAfter": [
-      "ghcr.io/devcontainers/features/common-utils",
-      "ghcr.io/devcontainers/features/oryx"
+    "ghcr.io/devcontainers/features/common-utils",
+    "ghcr.io/devcontainers/features/oryx"
   ]
 }

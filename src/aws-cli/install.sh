@@ -50,48 +50,29 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# Get central common setting
-get_common_setting() {
-    if [ "${common_settings_file_loaded}" != "true" ]; then
-        curl -sfL "https://aka.ms/vscode-dev-containers/script-library/settings.env" 2>/dev/null -o /tmp/vsdc-settings.env || echo "Could not download settings file. Skipping."
-        common_settings_file_loaded=true
-    fi
-    if [ -f "/tmp/vsdc-settings.env" ]; then
-        local multi_line=""
-        if [ "$2" = "true" ]; then multi_line="-z"; fi
-        local result="$(grep ${multi_line} -oP "$1=\"?\K[^\"]+" /tmp/vsdc-settings.env | tr -d '\0')"
-        if [ ! -z "${result}" ]; then declare -g $1="${result}"; fi
-    fi
-    echo "$1=${!1}"
-}
-
 apt_get_update()
 {
-    echo "Running apt-get update..."
-    apt-get update -y
+    if [ "$(find /var/lib/apt/lists/* | wc -l)" = "0" ]; then
+        echo "Running apt-get update..."
+        apt-get update -y
+    fi
 }
 
 # Checks if packages are installed and installs them if not
 check_packages() {
     if ! dpkg -s "$@" > /dev/null 2>&1; then
-        if [ "$(find /var/lib/apt/lists/* | wc -l)" = "0" ]; then
-            echo "Running apt-get update..."
-            apt-get update -y
-        fi
+        apt_get_update
         apt-get -y install --no-install-recommends "$@"
     fi
 }
 
 export DEBIAN_FRONTEND=noninteractive
 
-check_packages curl ca-certificates gnupg2 dirmngr unzip
+check_packages curl ca-certificates gnupg2 dirmngr unzip bash-completion
 
 verify_aws_cli_gpg_signature() {
     local filePath=$1
     local sigFilePath=$2
-
-    get_common_setting AWSCLI_GPG_KEY
-    get_common_setting AWSCLI_GPG_KEY_MATERIAL true
     local awsGpgKeyring=aws-cli-public-key.gpg
 
     echo "${AWSCLI_GPG_KEY_MATERIAL}" | gpg --dearmor > "./${awsGpgKeyring}"
@@ -131,6 +112,17 @@ install() {
 
     unzip "${scriptZipFile}"
     ./aws/install
+
+    # kubectl bash completion
+    mkdir -p /etc/bash_completion.d
+    cp ./scripts/vendor/aws_bash_completer /etc/bash_completion.d/aws
+
+    # kubectl zsh completion
+    if [ -e "${USERHOME}/.oh-my-zsh" ]; then
+        mkdir -p "${USERHOME}/.oh-my-zsh/completions"
+        cp ./scripts/vendor/aws_zsh_completer.sh "${USERHOME}/.oh-my-zsh/completions/_aws"
+        chown -R "${USERNAME}" "${USERHOME}/.oh-my-zsh"
+    fi
 
     rm -rf ./aws
 }
