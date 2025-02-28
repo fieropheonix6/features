@@ -70,11 +70,29 @@ check_packages() {
     fi
 }
 
+install_dotnet_with_script()
+{
+    local version="$1"
+    CURRENT_DIR=$(dirname "${BASH_SOURCE[0]}")
+    DOTNET_INSTALL_SCRIPT="$CURRENT_DIR/scripts/vendor/dotnet-install.sh"
+    DOTNET_INSTALL_DIR='/usr/share/dotnet'
+
+    check_packages icu-devtools
+
+    "$DOTNET_INSTALL_SCRIPT" \
+        --version "$version" \
+        --install-dir "$DOTNET_INSTALL_DIR" \
+        --no-path
+
+    DOTNET_BINARY="dotnet"
+    export PATH="${PATH}:/usr/share/dotnet"
+}
+
 install_dotnet_using_apt() {
     echo "Attempting to auto-install dotnet..."
     install_from_microsoft_feed=false
     apt_get_update
-    DOTNET_INSTALLATION_PACKAGE="dotnet7"
+    DOTNET_INSTALLATION_PACKAGE="dotnet8"
     apt-get -yq install $DOTNET_INSTALLATION_PACKAGE || install_from_microsoft_feed="true"
 
     if [ "${install_from_microsoft_feed}" = "true" ]; then
@@ -82,10 +100,11 @@ install_dotnet_using_apt() {
         curl -sSL ${MICROSOFT_GPG_KEYS_URI} | gpg --dearmor > /usr/share/keyrings/microsoft-archive-keyring.gpg
         echo "deb [arch=${architecture} signed-by=/usr/share/keyrings/microsoft-archive-keyring.gpg] https://packages.microsoft.com/repos/microsoft-${ID}-${VERSION_CODENAME}-prod ${VERSION_CODENAME} main" > /etc/apt/sources.list.d/microsoft.list
         apt-get update -y
-        DOTNET_INSTALLATION_PACKAGE="dotnet-sdk-7.0"
+        DOTNET_INSTALLATION_PACKAGE="dotnet-sdk-8.0"
         DOTNET_SKIP_FIRST_TIME_EXPERIENCE="true" apt-get install -yq $DOTNET_INSTALLATION_PACKAGE
     fi
 
+    DOTNET_BINARY="/usr/bin/dotnet"
     echo -e "Finished attempt to install dotnet.  Sdks installed:\n"
     dotnet --list-sdks
 
@@ -130,19 +149,25 @@ DOTNET_BINARY=""
 
 if dotnet --version > /dev/null ; then
     DOTNET_BINARY=$(which dotnet)
+    RUNTIME_VERSIONS=$(dotnet --list-runtimes | awk '{print $2}' | sort | uniq)
 fi
 
-# Oryx needs to be built with .NET 7
-if [[ "${DOTNET_BINARY}" = "" ]] || [[ "$(dotnet --version)" != *"7"* ]] ; then
-    echo "'dotnet 7' was not detected. Attempting to install .NET 7 to build oryx."
-    install_dotnet_using_apt
+MAJOR_VERSION_ID=$(echo $(dotnet --version) | cut -d . -f 1)
+PATCH_VERSION_ID=$(echo $(dotnet --version) | cut -d . -f 3)
 
+PINNED_SDK_VERSION=""
+# Oryx needs to be built with .NET 8
+if [[ "${DOTNET_BINARY}" = "" ]] || [[ $MAJOR_VERSION_ID != "8" ]] || [[ $MAJOR_VERSION_ID = "8" && ${PATCH_VERSION_ID} -ne "202" ]] ; then
+    echo "'dotnet 8' was not detected. Attempting to install .NET 8 to build oryx."
+    # The oryx build fails with .Net 8.0.201, see https://github.com/devcontainers/images/issues/974
+    # Pinning it to a working version until the upstream Oryx repo updates the dependency
+    # install_dotnet_using_apt
+    PINNED_SDK_VERSION="8.0.202"
+    install_dotnet_with_script ${PINNED_SDK_VERSION}
     if ! dotnet --version > /dev/null ; then
         echo "(!) Please install Dotnet before installing Oryx"
         exit 1
     fi
-
-    DOTNET_BINARY="/usr/bin/dotnet"
 fi
 
 BUILD_SCRIPT_GENERATOR=/usr/local/buildscriptgen
@@ -154,14 +179,19 @@ mkdir -p ${ORYX}
 
 git clone --depth=1 https://github.com/microsoft/Oryx $GIT_ORYX
 
+if [[ "${PINNED_SDK_VERSION}" != "" ]]; then
+    cd $GIT_ORYX
+    dotnet new globaljson --sdk-version ${PINNED_SDK_VERSION}
+fi
+
 SOLUTION_FILE_NAME="Oryx.sln"
 echo "Building solution '$SOLUTION_FILE_NAME'..."
 
 cd $GIT_ORYX
 ${DOTNET_BINARY} build "$SOLUTION_FILE_NAME" -c Debug
 
-${DOTNET_BINARY} publish -property:ValidateExecutableReferencesMatchSelfContained=false -r linux-x64 -o ${BUILD_SCRIPT_GENERATOR} -c Release $GIT_ORYX/src/BuildScriptGeneratorCli/BuildScriptGeneratorCli.csproj
-${DOTNET_BINARY} publish -r linux-x64 -o ${BUILD_SCRIPT_GENERATOR} -c Release $GIT_ORYX/src/BuildServer/BuildServer.csproj
+${DOTNET_BINARY} publish -property:ValidateExecutableReferencesMatchSelfContained=false -r linux-x64 -o ${BUILD_SCRIPT_GENERATOR} -c Release $GIT_ORYX/src/BuildScriptGeneratorCli/BuildScriptGeneratorCli.csproj --self-contained true
+${DOTNET_BINARY} publish -r linux-x64 -o ${BUILD_SCRIPT_GENERATOR} -c Release $GIT_ORYX/src/BuildServer/BuildServer.csproj --self-contained true
 
 chmod a+x ${BUILD_SCRIPT_GENERATOR}/GenerateBuildScript
 
@@ -200,6 +230,21 @@ rm -rf /root/.local/share/NuGet
 if [[ "${DOTNET_INSTALLATION_PACKAGE}" != "" ]]; then
     apt purge -yq $DOTNET_INSTALLATION_PACKAGE
 fi
+
+if [[ "${PINNED_SDK_VERSION}" != "" ]]; then
+    rm -f ${GIT_ORYX}/global.json
+    rm -rf /usr/share/dotnet/sdk/$PINNED_SDK_VERSION
+    NEW_RUNTIME_VERSIONS=$(dotnet --list-runtimes | awk '{print $2}' | sort | uniq)
+    if [ -n "${RUNTIME_VERSIONS:-}" ]; then
+        SDK_INSTALLED_RUNTIME=$(echo "$NEW_RUNTIME_VERSIONS" | grep -vxFf <(echo "$RUNTIME_VERSIONS"))
+    else
+        SDK_INSTALLED_RUNTIME="$NEW_RUNTIME_VERSIONS"
+    fi
+    rm -rf /usr/share/dotnet/shared/Microsoft.NETCore.App/$SDK_INSTALLED_RUNTIME
+    rm -rf /usr/share/dotnet/shared/Microsoft.AspNetCore.App/$SDK_INSTALLED_RUNTIME
+    rm -rf /usr/share/dotnet/templates/$SDK_INSTALLED_RUNTIME
+fi
+
 
 # Clean up
 rm -rf /var/lib/apt/lists/*

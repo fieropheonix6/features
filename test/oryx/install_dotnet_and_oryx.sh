@@ -5,6 +5,9 @@ set -e
 # Optional: Import test library
 source dev-container-features-test-lib
 
+# Runtimes are listed twice due to 'Microsoft.NETCore.App' and 'Microsoft.AspNetCore.App'
+check "two versions of dotnet runtimes are present" bash -c "[ $(dotnet --list-runtimes | wc -l) -eq 4 ]"
+
 check "Oryx version" oryx --version
 check "Dotnet is not removed if it is not installed by the Oryx Feature" dotnet --version
 
@@ -26,9 +29,9 @@ mkdir -p /opt/oryx
 echo "vso-focal" >> /opt/oryx/.imagetype
 
 mkdir -p /opt/dotnet/lts
-cp -R /usr/local/dotnet/current/dotnet /opt/dotnet/lts
-cp -R /usr/local/dotnet/current/LICENSE.txt /opt/dotnet/lts
-cp -R /usr/local/dotnet/current/ThirdPartyNotices.txt /opt/dotnet/lts
+cp -R /usr/share/dotnet/dotnet /opt/dotnet/lts
+cp -R /usr/share/dotnet/LICENSE.txt /opt/dotnet/lts
+cp -R /usr/share/dotnet/ThirdPartyNotices.txt /opt/dotnet/lts
 
 # Install platforms with oryx build tool
 check "oryx-install-dotnet-2.1-universal" oryx prep --skip-detection --platforms-and-versions dotnet=2.1.30
