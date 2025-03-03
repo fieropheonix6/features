@@ -17,10 +17,13 @@ packages="$(python3 -m pip list)"
 check "location" grep jupyter <<< "$packages"
 
 # Check for git extension
-check "jupyterlab-git" grep jupyterlab-git <<< "$packages"
+check "jupyterlab_git" grep jupyterlab_git <<< "$packages"
 
 # Check for correct JupyterLab configuration
 check "config" grep ".*.allow_origin = '*'" /home/vscode/.jupyter/jupyter_server_config.py
+
+#check "default path has jupyterlab symlink"
+check "default path has jupyterlab" test -L "/usr/local/jupyter"
 
 # Report result
 reportResults

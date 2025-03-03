@@ -15,30 +15,23 @@ rm -rf /var/lib/apt/lists/*
 AZ_VERSION=${VERSION:-"latest"}
 AZ_EXTENSIONS=${EXTENSIONS}
 AZ_INSTALLBICEP=${INSTALLBICEP:-false}
-
+AZ_BICEPVERSION=${BICEPVERSION:-latest}
+INSTALL_USING_PYTHON=${INSTALLUSINGPYTHON:-false}
 MICROSOFT_GPG_KEYS_URI="https://packages.microsoft.com/keys/microsoft.asc"
-AZCLI_ARCHIVE_ARCHITECTURES="amd64"
-AZCLI_ARCHIVE_VERSION_CODENAMES="stretch buster bullseye bionic focal jammy"
+AZCLI_ARCHIVE_ARCHITECTURES="amd64 arm64"
+AZCLI_ARCHIVE_VERSION_CODENAMES="stretch bookworm buster bullseye bionic focal jammy noble"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo -e 'Script must be run as root. Use sudo, su, or add "USER root" to your Dockerfile before running this script.'
     exit 1
 fi
 
-# Get central common setting
-get_common_setting() {
-    if [ "${common_settings_file_loaded}" != "true" ]; then
-        curl -sfL "https://aka.ms/vscode-dev-containers/script-library/settings.env" 2>/dev/null -o /tmp/vsdc-settings.env || echo "Could not download settings file. Skipping."
-        common_settings_file_loaded=true
-    fi
-    if [ -f "/tmp/vsdc-settings.env" ]; then
-        local multi_line=""
-        if [ "$2" = "true" ]; then multi_line="-z"; fi
-        local result="$(grep ${multi_line} -oP "$1=\"?\K[^\"]+" /tmp/vsdc-settings.env | tr -d '\0')"
-        if [ ! -z "${result}" ]; then declare -g $1="${result}"; fi
-    fi
-    echo "$1=${!1}"
-}
+if [ -z "${_REMOTE_USER}" ]; then
+    echo -e 'Feature script must be executed by a tool that implements the dev container specification. See https://containers.dev/ for more information.'
+    exit 1
+fi
+
+echo "Effective REMOTE_USER: ${_REMOTE_USER}"
 
 apt_get_update()
 {
@@ -56,8 +49,6 @@ check_packages() {
         apt-get -y install --no-install-recommends "$@"
     fi
 }
-
-export DEBIAN_FRONTEND=noninteractive
 
 # Soft version matching that resolves a version for a given package in the *current apt-cache*
 # Return value is stored in first argument (the unprocessed version)
@@ -105,7 +96,6 @@ install_using_apt() {
     # Install dependencies
     check_packages apt-transport-https curl ca-certificates gnupg2 dirmngr
     # Import key safely (new 'signed-by' method rather than deprecated apt-key approach) and install
-    get_common_setting MICROSOFT_GPG_KEYS_URI
     curl -sSL ${MICROSOFT_GPG_KEYS_URI} | gpg --dearmor > /usr/share/keyrings/microsoft-archive-keyring.gpg
     echo "deb [arch=${architecture} signed-by=/usr/share/keyrings/microsoft-archive-keyring.gpg] https://packages.microsoft.com/repos/azure-cli/ ${VERSION_CODENAME} main" > /etc/apt/sources.list.d/azure-cli.list
     apt-get update
@@ -127,7 +117,43 @@ install_using_apt() {
     fi
 }
 
-install_using_pip() {
+install_using_pip_strategy() {
+    local ver=""
+    if [ "${AZ_VERSION}" = "latest" ] || [ "${AZ_VERSION}" = "lts" ] || [ "${AZ_VERSION}" = "stable" ]; then
+        # Empty, meaning grab the "latest" in the apt repo
+        ver=""
+    else
+        ver="==${AZ_VERSION}"
+    fi
+
+    if [ "${INSTALL_USING_PYTHON}" = "true" ]; then
+        install_with_complete_python_installation "${ver}" || install_with_pipx "${ver}" || return 1
+    else
+        install_with_pipx "${ver}" || install_with_complete_python_installation "${ver}" || return 1
+    fi
+}
+
+install_with_pipx() {
+    echo "(*) Attempting to install globally with pipx..."
+    local ver="$1"
+    export 
+    local 
+
+    if ! type pipx > /dev/null 2>&1; then
+        echo "(*) Installing pipx..."
+        check_packages pipx
+        pipx ensurepath # Ensures PIPX_BIN_DIR is on the PATH
+    fi
+
+    PIPX_HOME="/usr/local/pipx" \
+    PIPX_BIN_DIR=/usr/local/bin \
+    pipx install azure-cli${ver}
+
+    echo "(*) Finished installing globally with pipx."
+}
+
+install_with_complete_python_installation() {
+    local ver="$1"
     echo "(*) No pre-built binaries available in apt-cache. Installing via pip3."
     if ! dpkg -s python3-minimal python3-pip libffi-dev python3-venv > /dev/null 2>&1; then
         apt_get_update
@@ -144,39 +170,36 @@ install_using_pip() {
         pipx_bin=/tmp/pip-tmp/bin/pipx
     fi
 
-    if [ "${AZ_VERSION}" = "latest" ] || [ "${AZ_VERSION}" = "lts" ] || [ "${AZ_VERSION}" = "stable" ]; then
-        # Empty, meaning grab the "latest" in the apt repo
-        ver=""
-    else
-        ver="==${AZ_VERSION}"
-    fi
-
     set +e
         ${pipx_bin} install --pip-args '--no-cache-dir --force-reinstall' -f azure-cli${ver}
 
         # Fail gracefully
         if [ "$?" != 0 ]; then
-            echo "Could not install azure-cli${ver} via pip"
+            echo "Could not install azure-cli${ver} via pip3"
             rm -rf /tmp/pip-tmp
             return 1
         fi
     set -e
 }
 
-# See if we're on x86_64 and if so, install via apt-get, otherwise use pip3
+export DEBIAN_FRONTEND=noninteractive
+
+# See if we're on x86_64 or AARCH64 and if so, install via apt-get, otherwise use pip3
 echo "(*) Installing Azure CLI..."
 . /etc/os-release
 architecture="$(dpkg --print-architecture)"
 CACHED_AZURE_VERSION="${AZ_VERSION}" # In case we need to fallback to pip and the apt path has modified the AZ_VERSION variable.
-if [[ "${AZCLI_ARCHIVE_ARCHITECTURES}" = *"${architecture}"* ]] && [[  "${AZCLI_ARCHIVE_VERSION_CODENAMES}" = *"${VERSION_CODENAME}"* ]]; then
-    install_using_apt || use_pip="true"
+if [ "${INSTALL_USING_PYTHON}" != "true" ]; then
+    if [[ "${AZCLI_ARCHIVE_ARCHITECTURES}" = *"${architecture}"* ]] && [[  "${AZCLI_ARCHIVE_VERSION_CODENAMES}" = *"${VERSION_CODENAME}"* ]]; then
+        install_using_apt || use_pip="true"
+    fi
 else
     use_pip="true"
 fi
 
-if [ "${use_pip}" = "true" ]; then
+if [ "${use_pip}" = "true" ]; then 
     AZ_VERSION=${CACHED_AZURE_VERSION}
-    install_using_pip
+    install_using_pip_strategy
 
     if [ "$?" != 0 ]; then
         echo "Please provide a valid version for your distribution ${ID} ${VERSION_CODENAME} (${architecture})."
@@ -207,10 +230,16 @@ if [ "${AZ_INSTALLBICEP}" = "true" ]; then
     # The `az bicep install --target-platform` could be a solution; however, linux-arm64 is not an allowed value for this argument yet
     # Manually installing Bicep and moving to the appropriate directory where az expects it to be
     
+    if [ "${AZ_BICEPVERSION}" = "latest" ]; then
+        bicep_download_path="https://github.com/Azure/bicep/releases/latest/download"
+    else
+        bicep_download_path="https://github.com/Azure/bicep/releases/download/${AZ_BICEPVERSION}"
+    fi
+
     if [ "${architecture}" = "arm64" ]; then
-        curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-arm64
+        curl -Lo bicep ${bicep_download_path}/bicep-linux-arm64
     else 
-        curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+        curl -Lo bicep ${bicep_download_path}/bicep-linux-x64
     fi
     
     chmod +x ./bicep
